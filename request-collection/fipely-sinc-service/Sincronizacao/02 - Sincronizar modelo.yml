@@ -1,0 +1,34 @@
+info:
+  name: Sincronizar modelo (todos os anos e combustíveis)
+  type: http
+  seq: 2
+
+http:
+  method: POST
+  url: "{{baseurl}}/sync/models?refreshOldRecords={{refreshOldRecords}}"
+  headers:
+    - name: X-API-Token
+      value: "{{apiToken}}"
+    - name: Content-Type
+      value: application/json
+  params:
+    - name: refreshOldRecords
+      value: "{{refreshOldRecords}}"
+      type: query
+  body:
+    type: json
+    data: |-
+      {
+        "referenceMonth": "{{referenceMonth}}",
+        "vehicleType": {{vehicleType}},
+        "brandCode": "{{brandCode}}",
+        "modelCode": {{modelCode}}
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: true

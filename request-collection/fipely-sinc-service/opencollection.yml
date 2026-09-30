@@ -1,0 +1,11 @@
+opencollection: 1.0.0
+
+info:
+  name: fipely-sinc-service
+bundled: false
+extensions:
+  bruno:
+    defaultEnvironment: Local
+    ignore:
+      - node_modules
+      - .git

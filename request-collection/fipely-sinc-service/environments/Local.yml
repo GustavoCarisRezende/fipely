@@ -1,0 +1,29 @@
+name: Local
+variables:
+  - name: baseurl
+    value: http://localhost:8080/fipely-sinc-service/api/v1
+    description: Endereço local da API de sincronização.
+  - name: referenceMonth
+    value: 2001-01
+    description: Mês de referência no formato aaaa-MM (ou MM/aaaa).
+  - name: vehicleType
+    value: "2"
+    description: 1 = carro, 2 = moto, 3 = caminhão.
+  - name: brandCode
+    value: "80"
+    description: Código FIPE da marca (80 = HONDA para motos no exemplo de 07/2026).
+  - name: modelCode
+    value: "10378"
+    description: Código FIPE do modelo CB 300F Twister Flex no exemplo de 07/2026.
+  - name: modelYear
+    value: "2023"
+    description: Ano-modelo usado no exemplo.
+  - name: fuelCode
+    value: "5"
+    description: Código de combustível da opção 2023-5 do exemplo.
+  - name: refreshOldRecords
+    value: "false"
+    description: Reconsultar dados com pelo menos app.sync.min-age-days dias (padrão 365); só afeta os POST de sincronização.
+  - secret: true
+    name: apiToken
+    description: Preencha no Bruno com o mesmo valor de FIPELY_API_TOKEN usado para iniciar o serviço.

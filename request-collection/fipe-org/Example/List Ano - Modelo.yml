@@ -1,0 +1,39 @@
+info:
+  name: List Ano / Modelo
+  type: http
+  seq: 4
+
+http:
+  method: post
+  url: https://veiculos.fipe.org.br/api/veiculos/ConsultarAnoModelo
+  body:
+    type: form-urlencoded
+    data:
+      - name: codigoTipoVeiculo
+        value: "2"
+      - name: codigoTabelaReferencia
+        value: "337"
+      - name: codigoModelo
+        value: "10378"
+      - name: codigoMarca
+        value: "80"
+      - name: ano
+        value: ""
+        disabled: true
+      - name: codigoTipoCombustivel
+        value: ""
+        disabled: true
+      - name: anoModelo
+        value: ""
+        disabled: true
+      - name: modeloCodigoExterno
+        value: ""
+        disabled: true
+  auth: inherit
+
+settings:
+  encodeUrl: false
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: false

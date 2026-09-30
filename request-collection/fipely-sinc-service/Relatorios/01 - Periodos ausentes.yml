@@ -1,0 +1,23 @@
+info:
+  name: Períodos ausentes no banco (comparação com a FIPE)
+  type: http
+  seq: 1
+
+http:
+  method: GET
+  url: "{{baseurl}}/reports/periods/absent?refreshOldRecords={{refreshOldRecords}}"
+  headers:
+    - name: X-API-Token
+      value: "{{apiToken}}"
+  params:
+    - name: refreshOldRecords
+      value: "{{refreshOldRecords}}"
+      type: query
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: true

@@ -1,0 +1,16 @@
+info:
+  name: List Períodos
+  type: http
+  seq: 1
+
+http:
+  method: post
+  url: https://veiculos.fipe.org.br/api/veiculos/ConsultarTabelaDeReferencia
+  auth: inherit
+
+settings:
+  encodeUrl: false
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: false

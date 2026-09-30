@@ -1,0 +1,38 @@
+info:
+  name: List All Info
+  type: http
+  seq: 5
+
+http:
+  method: post
+  url: https://veiculos.fipe.org.br/api/veiculos/ConsultarValorComTodosParametros
+  body:
+    type: form-urlencoded
+    data:
+      - name: codigoTabelaReferencia
+        value: "337"
+      - name: codigoMarca
+        value: "80"
+      - name: codigoModelo
+        value: "10378"
+      - name: codigoTipoVeiculo
+        value: "2"
+      - name: anoModelo
+        value: "2023"
+      - name: codigoTipoCombustivel
+        value: "5"
+      - name: tipoVeiculo
+        value: moto
+      - name: modeloCodigoExterno
+        value: ""
+        disabled: true
+      - name: tipoConsulta
+        value: tradicional
+  auth: inherit
+
+settings:
+  encodeUrl: false
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: false

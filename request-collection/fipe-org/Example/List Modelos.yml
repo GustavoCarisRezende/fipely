@@ -1,0 +1,42 @@
+info:
+  name: List Modelos
+  type: http
+  seq: 3
+
+http:
+  method: post
+  url: https://veiculos.fipe.org.br/api/veiculos/ConsultarModelos
+  body:
+    type: form-urlencoded
+    data:
+      - name: codigoTipoVeiculo
+        value: "2"
+        description: 2 - Moto
+      - name: codigoTabelaReferencia
+        value: "337"
+        description: 337 - 09/2026
+      - name: codigoModelo
+        value: ""
+        disabled: true
+      - name: codigoMarca
+        value: "80"
+        description: 80 - Honda
+      - name: ano
+        value: ""
+      - name: codigoTipoCombustivel
+        value: ""
+        disabled: true
+      - name: anoModelo
+        value: ""
+        disabled: true
+      - name: modeloCodigoExterno
+        value: ""
+        disabled: true
+  auth: inherit
+
+settings:
+  encodeUrl: false
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
