@@ -1,8 +1,11 @@
 package br.com.fipe.sinc_service.controller;
 
+import br.com.fipe.sinc_service.dto.CatalogSyncRequest;
+import br.com.fipe.sinc_service.dto.SyncProgress;
 import br.com.fipe.sinc_service.dto.SyncRequest;
 import br.com.fipe.sinc_service.dto.SyncResult;
 import br.com.fipe.sinc_service.repository.CatalogRepository;
+import br.com.fipe.sinc_service.service.SyncProgressService;
 import br.com.fipe.sinc_service.service.SyncService;
 import java.time.LocalDate;
 import java.util.List;
@@ -24,10 +27,12 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 public class SyncController {
     private final SyncService sync;
     private final CatalogRepository repository;
+    private final SyncProgressService progress;
 
-    public SyncController(SyncService sync, CatalogRepository repository) {
+    public SyncController(SyncService sync, CatalogRepository repository, SyncProgressService progress) {
         this.sync = sync;
         this.repository = repository;
+        this.progress = progress;
     }
 
     @PostMapping("/sync/periods")
@@ -52,6 +57,25 @@ public class SyncController {
     public SyncResult variant(@RequestBody SyncRequest request,
                               @RequestParam(defaultValue = "false") boolean refreshOldRecords) {
         return sync.sync(SyncService.Scope.VARIANT, request, refreshOldRecords);
+    }
+
+    @PostMapping("/sync/catalog")
+    public SyncResult catalog(@RequestBody(required = false) CatalogSyncRequest request,
+                              @RequestParam(defaultValue = "false") boolean refreshOldRecords) {
+        return sync.syncCatalog(request, refreshOldRecords);
+    }
+
+    @GetMapping("/sync/jobs")
+    public List<SyncProgress> jobs(@RequestParam(required = false) String status,
+                                   @RequestParam(defaultValue = "20") int limit,
+                                   @RequestParam(defaultValue = "false") boolean refreshOldRecords) {
+        return progress.list(status, limit);
+    }
+
+    @GetMapping("/sync/jobs/{jobId}")
+    public SyncProgress job(@PathVariable long jobId,
+                            @RequestParam(defaultValue = "false") boolean refreshOldRecords) {
+        return progress.find(jobId);
     }
 
     // History and reports are read-only. The flag is accepted consistently on every endpoint.

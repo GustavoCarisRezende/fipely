@@ -1,6 +1,7 @@
 package br.com.fipe.sinc_service.service;
 
 import br.com.fipe.sinc_service.domain.Catalog;
+import br.com.fipe.sinc_service.dto.CatalogSyncRequest;
 import br.com.fipe.sinc_service.dto.FipeResponses;
 import br.com.fipe.sinc_service.dto.SyncRequest;
 import br.com.fipe.sinc_service.dto.SyncResult;
@@ -41,19 +42,29 @@ public class SyncService implements DisposableBean {
 
     private final CatalogRepository repository;
     private final FipeClient client;
+    private final SyncProgressService progress;
     private final int ageDays;
+    private final long referencePeriodCacheMinutes;
+    private volatile CachedPeriods periodsCache;
     private final Semaphore concurrency;
+    // Bounded striped locks prevent overlapping scopes from fetching the same FIPE resource.
+    private final Object[] resourceLocks = new Object[256];
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     private final ConcurrentHashMap<String, CompletableFuture<SyncResult>> jobs = new ConcurrentHashMap<>();
 
-    public SyncService(CatalogRepository repository, FipeClient client,
+    public SyncService(CatalogRepository repository, FipeClient client, SyncProgressService progress,
                        @Value("${app.sync.min-age-days:365}") int ageDays,
-                       @Value("${app.fipe.max-concurrent-syncs:2}") int threads) {
-        if (ageDays < 1 || threads < 1) throw new IllegalArgumentException("Invalid sync configuration");
+                       @Value("${app.fipe.max-concurrent-syncs:2}") int threads,
+                       @Value("${app.fipe.reference-period-cache-minutes:1440}") long cacheMinutes) {
+        if (ageDays < 1 || threads < 1 || cacheMinutes < 1)
+            throw new IllegalArgumentException("Invalid sync configuration");
         this.repository = repository;
         this.client = client;
+        this.progress = progress;
         this.ageDays = ageDays;
+        this.referencePeriodCacheMinutes = cacheMinutes;
         this.concurrency = new Semaphore(threads);
+        for (int i = 0; i < resourceLocks.length; i++) resourceLocks[i] = new Object();
     }
 
     public SyncResult sync(Scope scope, SyncRequest request, boolean refreshOldRecords) {
@@ -64,27 +75,146 @@ public class SyncService implements DisposableBean {
                 + ":" + refreshOldRecords;
         // Coordinators do not consume a worker slot; child vehicle-type syncs can run concurrently.
         if (scope == Scope.PERIOD) return await(sharedFuture(key,
-                () -> fullPeriod(month, refreshOldRecords), false));
-        return await(sharedFuture(key, () -> scoped(scope, month, request, refreshOldRecords), true));
+                () -> runJob(scope, month, request, refreshOldRecords), false));
+        return await(sharedFuture(key, () -> runJob(scope, month, request, refreshOldRecords), true));
     }
 
     public List<LocalDate> absentPeriods() {
         Set<LocalDate> local = new HashSet<>(repository.localMonths());
-        return client.periods().stream().map(p -> parseSourceMonth(p.month()))
+        return referencePeriods().stream().map(p -> parseSourceMonth(p.month()))
                 .filter(month -> !local.contains(month)).distinct().sorted().toList();
     }
+
+    public SyncResult syncCatalog(CatalogSyncRequest body, boolean refreshOldRecords) {
+        CatalogSyncRequest request = body == null ? new CatalogSyncRequest(null, null, null) : body;
+        if (request.vehicleType() != null && (request.vehicleType() < 1 || request.vehicleType() > 3))
+            throw new IllegalArgumentException("vehicleType must be 1..3");
+        YearMonth month = request.referenceMonth() == null || request.referenceMonth().isBlank()
+                ? latestPeriod() : parseMonth(request.referenceMonth());
+        String key = "catalog:" + month + ":" + request.vehicleType() + ":"
+                + request.variantsRequested() + ":" + refreshOldRecords;
+        return await(sharedFuture(key, () -> runCatalog(request, month, refreshOldRecords), false));
+    }
+
+    private YearMonth latestPeriod() {
+        return referencePeriods().stream().map(p -> YearMonth.from(parseSourceMonth(p.month())))
+                .max(YearMonth::compareTo)
+                .orElseThrow(() -> new IllegalStateException("FIPE did not return any reference periods"));
+    }
+
+    private List<FipeResponses.Period> referencePeriods() {
+        CachedPeriods cached = periodsCache;
+        if (cached != null && Instant.now().isBefore(cached.expiresAt())) return cached.data();
+        synchronized (this) {
+            cached = periodsCache;
+            if (cached != null && Instant.now().isBefore(cached.expiresAt())) return cached.data();
+            List<FipeResponses.Period> response = client.periods();
+            if (response == null || response.isEmpty())
+                throw new IllegalStateException("FIPE did not return any reference periods");
+            periodsCache = new CachedPeriods(List.copyOf(response),
+                    Instant.now().plusSeconds(referencePeriodCacheMinutes * 60));
+            return periodsCache.data();
+        }
+    }
+
+    private record CachedPeriods(List<FipeResponses.Period> data, Instant expiresAt) {}
 
     public List<CatalogRepository.IncompletePeriod> incompletePeriods() {
         return repository.incompletePeriods();
     }
 
-    private SyncResult fullPeriod(YearMonth month, boolean refresh) {
+    private SyncResult runJob(Scope scope, YearMonth month, SyncRequest request, boolean refresh) {
+        long jobId = progress.create(scope.name().toLowerCase(Locale.ROOT), request,
+                month.atDay(1), refresh, null, false);
+        try {
+            SyncResult result = scope == Scope.PERIOD ? fullPeriod(month, refresh, jobId)
+                    : scoped(scope, month, request, refresh, jobId);
+            progress.finish(jobId, "completed", null);
+            return result;
+        } catch (RuntimeException e) {
+            if (scope == Scope.PERIOD) progress.failQueuedChildren(jobId, e.getMessage());
+            progress.finish(jobId, "failed", e.getMessage());
+            throw e;
+        }
+    }
+
+    private SyncResult runCatalog(CatalogSyncRequest request, YearMonth month, boolean refresh) {
+        long parentId = progress.createCatalog("catalog", request, month.atDay(1),
+                request.vehicleType(), refresh, null, false);
+        try {
+            Catalog.Period period = period(month);
+            progress.activity(parentId, "vehicleTypes", null, null, null);
+            List<CompletableFuture<SyncResult>> children = new ArrayList<>();
+            for (int type = 1; type <= 3; type++) {
+                if (request.vehicleType() != null && request.vehicleType() != type) continue;
+                int vehicleType = type;
+                long childId = progress.createCatalog("catalogType", request, month.atDay(1),
+                        type, refresh, parentId, true);
+                children.add(sharedFuture("catalogType:" + childId,
+                        () -> syncCatalogType(period, vehicleType, request.variantsRequested(), refresh, childId), true));
+            }
+            int brands = 0, models = 0, variants = 0;
+            RuntimeException firstError = null;
+            for (CompletableFuture<SyncResult> future : children) {
+                try {
+                    SyncResult result = await(future);
+                    brands += result.brands();
+                    models += result.models();
+                    variants += result.variants();
+                } catch (RuntimeException e) {
+                    if (firstError == null) firstError = e;
+                }
+            }
+            if (firstError != null) throw firstError;
+            progress.finish(parentId, "completed", null);
+            return new SyncResult(parentId, month.toString(), "catalog", children.size(),
+                    brands, models, variants, 0);
+        } catch (RuntimeException e) {
+            progress.failQueuedChildren(parentId, e.getMessage());
+            progress.finish(parentId, "failed", e.getMessage());
+            throw e;
+        }
+    }
+
+    private SyncResult syncCatalogType(Catalog.Period period, int type, boolean includeVariants,
+                                       boolean refresh, long jobId) {
+        progress.start(jobId);
+        Counters count = new Counters();
+        try {
+            List<Catalog.Brand> availableBrands = brands(period, type, refresh, count, jobId);
+            progress.discovered(jobId, availableBrands.size(), 0, 0);
+            for (Catalog.Brand brand : availableBrands) {
+                List<Catalog.Model> availableModels = models(period, brand, refresh, count, jobId);
+                progress.discovered(jobId, 0, availableModels.size(), 0);
+                if (!includeVariants) continue;
+                for (Catalog.Model model : availableModels) {
+                    int before = count.variants;
+                    List<Catalog.Variant> years = variants(period, brand, model, refresh, count, jobId);
+                    progress.discovered(jobId, 0, 0, years.size());
+                    int fetched = Math.min(years.size(), count.variants - before);
+                    progress.processedBatch(jobId, fetched, true);
+                    progress.processedBatch(jobId, years.size() - fetched, false);
+                }
+            }
+            progress.finish(jobId, "completed", null);
+            return count.result(jobId, period.month(), "catalogType", 1);
+        } catch (RuntimeException e) {
+            progress.finish(jobId, "failed", e.getMessage());
+            throw e;
+        }
+    }
+
+    private SyncResult fullPeriod(YearMonth month, boolean refresh, long parentJobId) {
         Catalog.Period period = period(month);
+        progress.activity(parentJobId, "vehicleTypes", null, null, null);
         List<CompletableFuture<SyncResult>> futures = new ArrayList<>();
         for (int type = 1; type <= 3; type++) {
             int vehicleType = type;
-            String key = "type:" + month + ":" + type + ":" + refresh;
-            futures.add(sharedFuture(key, () -> syncType(period, vehicleType, refresh), true));
+            SyncRequest child = new SyncRequest(month.toString(), type, null, null, null, null);
+            long childJobId = progress.create("vehicleType", child, month.atDay(1),
+                    refresh, parentJobId, true);
+            futures.add(sharedFuture("type:" + childJobId,
+                    () -> syncType(period, vehicleType, refresh, childJobId), true));
         }
         int brands = 0, models = 0, variants = 0, prices = 0;
         RuntimeException firstError = null;
@@ -100,135 +230,189 @@ public class SyncService implements DisposableBean {
             }
         }
         if (firstError != null) throw firstError;
-        return new SyncResult(month.toString(), "period", 3, brands, models, variants, prices);
+        return new SyncResult(parentJobId, month.toString(), "period", 3, brands, models, variants, prices);
     }
 
-    private SyncResult syncType(Catalog.Period period, int type, boolean refresh) {
-        long run = repository.startRun(period.id(), type);
+    private SyncResult syncType(Catalog.Period period, int type, boolean refresh, long jobId) {
+        progress.start(jobId);
+        Long run = null;
         Counters count = new Counters();
         try {
-            for (Catalog.Brand brand : brands(period, type, refresh, count)) {
-                for (Catalog.Model model : models(period, brand, refresh, count)) {
-                    for (Catalog.Variant variant : variants(period, brand, model, refresh, count)) {
-                        price(period, brand, model, variant, refresh, count);
+            run = repository.startRun(period.id(), type);
+            List<Catalog.Brand> availableBrands = brands(period, type, refresh, count, jobId);
+            progress.discovered(jobId, availableBrands.size(), 0, 0);
+            for (Catalog.Brand brand : availableBrands) {
+                List<Catalog.Model> availableModels = models(period, brand, refresh, count, jobId);
+                progress.discovered(jobId, 0, availableModels.size(), 0);
+                for (Catalog.Model model : availableModels) {
+                    List<Catalog.Variant> availableVariants = variants(period, brand, model, refresh, count, jobId);
+                    progress.discovered(jobId, 0, 0, availableVariants.size());
+                    for (Catalog.Variant variant : availableVariants) {
+                        price(period, brand, model, variant, refresh, count, jobId);
                     }
                 }
             }
             repository.finishRun(run, "completed", null);
-            return count.result(period.month(), "vehicleType", 1);
+            progress.finish(jobId, "completed", null);
+            return count.result(jobId, period.month(), "vehicleType", 1);
         } catch (RuntimeException e) {
-            repository.finishRun(run, "failed", e.getMessage());
+            try {
+                if (run != null) repository.finishRun(run, "failed", e.getMessage());
+            } finally {
+                progress.finish(jobId, "failed", e.getMessage());
+            }
             throw e;
         }
     }
 
-    private SyncResult scoped(Scope scope, YearMonth month, SyncRequest request, boolean refresh) {
+    private SyncResult scoped(Scope scope, YearMonth month, SyncRequest request, boolean refresh, long jobId) {
+        if (scope == Scope.VARIANT && !due(repository.existingPriceStamp(month.atDay(1),
+                request.vehicleType(), request.brandCode(), request.modelCode(),
+                request.modelYear(), request.fuelCode()), refresh)) {
+            progress.activity(jobId, "cached", request.vehicleType(), request.brandCode(),
+                    String.valueOf(request.modelCode()));
+            progress.discovered(jobId, 1, 1, 1);
+            progress.discoveryComplete(jobId);
+            progress.processed(jobId, false);
+            return new Counters().result(jobId, month.atDay(1), "variant", 1);
+        }
         Catalog.Period period = period(month);
         Counters count = new Counters();
-        Catalog.Brand brand = brands(period, request.vehicleType(), refresh, count).stream()
+        Catalog.Brand brand = brands(period, request.vehicleType(), refresh, count, jobId).stream()
                 .filter(b -> b.code().equals(request.brandCode())).findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("Brand not listed in this period"));
+        progress.discovered(jobId, 1, 0, 0);
         if (scope == Scope.BRAND) {
-            for (Catalog.Model model : models(period, brand, refresh, count)) {
-                for (Catalog.Variant variant : variants(period, brand, model, refresh, count)) {
-                    price(period, brand, model, variant, refresh, count);
+            List<Catalog.Model> availableModels = models(period, brand, refresh, count, jobId);
+            progress.discovered(jobId, 0, availableModels.size(), 0);
+            for (Catalog.Model model : availableModels) {
+                List<Catalog.Variant> availableVariants = variants(period, brand, model, refresh, count, jobId);
+                progress.discovered(jobId, 0, 0, availableVariants.size());
+                for (Catalog.Variant variant : availableVariants) {
+                    price(period, brand, model, variant, refresh, count, jobId);
                 }
             }
         } else {
-            Catalog.Model model = models(period, brand, refresh, count).stream()
+            Catalog.Model model = models(period, brand, refresh, count, jobId).stream()
                     .filter(m -> m.code() == request.modelCode()).findFirst()
                     .orElseThrow(() -> new IllegalArgumentException("Model not listed in this period"));
-            List<Catalog.Variant> years = variants(period, brand, model, refresh, count);
+            progress.discovered(jobId, 0, 1, 0);
+            List<Catalog.Variant> years = variants(period, brand, model, refresh, count, jobId);
             if (scope == Scope.MODEL) {
-                for (Catalog.Variant variant : years) price(period, brand, model, variant, refresh, count);
+                progress.discovered(jobId, 0, 0, years.size());
+                progress.discoveryComplete(jobId);
+                for (Catalog.Variant variant : years) price(period, brand, model, variant, refresh, count, jobId);
             } else {
                 Catalog.Variant variant = years.stream()
                         .filter(v -> v.year() == request.modelYear() && v.fuelCode().equals(request.fuelCode()))
                         .findFirst().orElseThrow(() -> new IllegalArgumentException("Variant not listed in this period"));
-                price(period, brand, model, variant, refresh, count);
+                progress.discovered(jobId, 0, 0, 1);
+                progress.discoveryComplete(jobId);
+                price(period, brand, model, variant, refresh, count, jobId);
             }
         }
-        return count.result(period.month(), scope.name().toLowerCase(Locale.ROOT), 1);
+        return count.result(jobId, period.month(), scope.name().toLowerCase(Locale.ROOT), 1);
     }
 
     private Catalog.Period period(YearMonth month) {
-        return repository.period(month.atDay(1)).orElseGet(() -> client.periods().stream()
+        return repository.period(month.atDay(1)).orElseGet(() -> referencePeriods().stream()
                 .filter(p -> parseSourceMonth(p.month()).equals(month.atDay(1)))
                 .findFirst()
                 .map(p -> repository.savePeriod(p.code(), p.month(), month.atDay(1)))
                 .orElseThrow(() -> new IllegalArgumentException("Reference month unavailable at FIPE: " + month)));
     }
 
-    private List<Catalog.Brand> brands(Catalog.Period period, int type, boolean refresh, Counters count) {
-        if (due(repository.brandListStamp(period.id(), type), refresh)) {
-            FipeClient.Response<List<FipeResponses.Option>> response = client.brands(period.code(), type);
-            if (response.data() == null) throw new IllegalStateException("Empty FIPE brand response");
-            Instant now = Instant.now();
-            for (FipeResponses.Option option : response.data()) {
-                Catalog.Brand brand = repository.saveBrand(type, option.value(), option.label(), now);
-                repository.savePeriodBrand(period.id(), brand.id(), option.label(), now);
-                count.brands++;
+    private List<Catalog.Brand> brands(Catalog.Period period, int type, boolean refresh,
+                                        Counters count, long jobId) {
+        progress.activity(jobId, "brands", type, null, null);
+        synchronized (resourceLock("brands", period.id(), type)) {
+            if (due(repository.brandListStamp(period.id(), type), refresh)) {
+                FipeClient.Response<List<FipeResponses.Option>> response = client.brands(period.code(), type);
+                if (response.data() == null) throw new IllegalStateException("Empty FIPE brand response");
+                Instant now = Instant.now();
+                for (FipeResponses.Option option : response.data()) {
+                    Catalog.Brand brand = repository.saveBrand(type, option.value(), option.label(), now);
+                    repository.savePeriodBrand(period.id(), brand.id(), option.label(), now);
+                    count.brands++;
+                }
+                repository.saveBrandList(period.id(), type, response.raw(), now);
             }
-            repository.saveBrandList(period.id(), type, response.raw(), now);
+            return repository.brands(period.id(), type);
         }
-        return repository.brands(period.id(), type);
     }
 
     private List<Catalog.Model> models(Catalog.Period period, Catalog.Brand brand,
-                                        boolean refresh, Counters count) {
-        if (due(repository.modelListStamp(period.id(), brand.id()), refresh)) {
-            FipeClient.Response<FipeResponses.Models> response =
-                    client.models(period.code(), brand.type(), brand.code());
-            if (response.data() == null || response.data().models() == null || response.data().years() == null) {
-                throw new IllegalStateException("Invalid FIPE model response");
+                                        boolean refresh, Counters count, long jobId) {
+        progress.activity(jobId, "models", brand.type(), brand.code(), null);
+        synchronized (resourceLock("models", period.id(), brand.id())) {
+            if (due(repository.modelListStamp(period.id(), brand.id()), refresh)) {
+                FipeClient.Response<FipeResponses.Models> response =
+                        client.models(period.code(), brand.type(), brand.code());
+                if (response.data() == null || response.data().models() == null || response.data().years() == null) {
+                    throw new IllegalStateException("Invalid FIPE model response");
+                }
+                Instant now = Instant.now();
+                for (FipeResponses.ModelOption option : response.data().models()) {
+                    Catalog.Model model = repository.saveModel(brand.id(), option.value(), option.label(), now);
+                    repository.savePeriodModel(period.id(), brand.id(), model.id(), option.label(), now);
+                    count.models++;
+                }
+                repository.saveModelList(period.id(), brand.id(), response.raw(), now);
             }
-            Instant now = Instant.now();
-            for (FipeResponses.ModelOption option : response.data().models()) {
-                Catalog.Model model = repository.saveModel(brand.id(), option.value(), option.label(), now);
-                repository.savePeriodModel(period.id(), brand.id(), model.id(), option.label(), now);
-                count.models++;
-            }
-            repository.saveModelList(period.id(), brand.id(), response.raw(), now);
+            return repository.models(period.id(), brand.id());
         }
-        return repository.models(period.id(), brand.id());
     }
 
     private List<Catalog.Variant> variants(Catalog.Period period, Catalog.Brand brand,
-                                            Catalog.Model model, boolean refresh, Counters count) {
-        if (due(repository.yearListStamp(period.id(), model.id()), refresh)) {
-            FipeClient.Response<List<FipeResponses.Option>> response =
-                    client.years(period.code(), brand.type(), brand.code(), model.code());
-            if (response.data() == null) throw new IllegalStateException("Empty FIPE year response");
-            Instant now = Instant.now();
-            for (FipeResponses.Option option : response.data()) {
-                Matcher parsed = YEAR_FUEL.matcher(option.value());
-                if (!parsed.matches()) throw new IllegalStateException("Unknown FIPE year/fuel: " + option.value());
-                int year = Integer.parseInt(parsed.group(1));
-                Catalog.Variant variant = repository.saveVariant(model.id(), option.value(), year,
-                        parsed.group(2), now);
-                repository.savePeriodVariant(period.id(), model.id(), variant.id(), option.label(), now);
-                count.variants++;
+                                            Catalog.Model model, boolean refresh, Counters count, long jobId) {
+        progress.activity(jobId, "variants", brand.type(), brand.code(), model.name());
+        synchronized (resourceLock("years", period.id(), model.id())) {
+            if (due(repository.yearListStamp(period.id(), model.id()), refresh)) {
+                FipeClient.Response<List<FipeResponses.Option>> response =
+                        client.years(period.code(), brand.type(), brand.code(), model.code());
+                if (response.data() == null) throw new IllegalStateException("Empty FIPE year response");
+                Instant now = Instant.now();
+                for (FipeResponses.Option option : response.data()) {
+                    Matcher parsed = YEAR_FUEL.matcher(option.value());
+                    if (!parsed.matches()) throw new IllegalStateException("Unknown FIPE year/fuel: " + option.value());
+                    int year = Integer.parseInt(parsed.group(1));
+                    Catalog.Variant variant = repository.saveVariant(model.id(), option.value(), year,
+                            parsed.group(2), now);
+                    repository.savePeriodVariant(period.id(), model.id(), variant.id(), option.label(), now);
+                    count.variants++;
+                }
+                repository.saveYearList(period.id(), model.id(), response.raw(), now);
             }
-            repository.saveYearList(period.id(), model.id(), response.raw(), now);
+            return repository.variants(period.id(), model.id());
         }
-        return repository.variants(period.id(), model.id());
     }
 
     private void price(Catalog.Period period, Catalog.Brand brand, Catalog.Model model,
-                       Catalog.Variant variant, boolean refresh, Counters count) {
-        if (!due(repository.priceStamp(period.id(), variant.id()), refresh)) return;
-        FipeClient.Response<FipeResponses.Price> response = client.price(period.code(), brand.type(),
-                brand.code(), model.code(), variant.year(), variant.fuelCode());
-        FipeResponses.Price data = response.data();
-        if (data == null || data.vehicleType() != brand.type() || data.modelYear() != variant.year()
-                || data.fipeCode() == null || data.fipeCode().isBlank()) {
-            throw new IllegalStateException("Inconsistent FIPE price response");
+                       Catalog.Variant variant, boolean refresh, Counters count, long jobId) {
+        synchronized (resourceLock("price", period.id(), variant.id())) {
+            if (!due(repository.priceStamp(period.id(), variant.id()), refresh)) {
+                progress.processed(jobId, false);
+                return;
+            }
+            progress.activity(jobId, "prices", brand.type(), brand.code(), model.name());
+            FipeClient.Response<FipeResponses.Price> response = client.price(period.code(), brand.type(),
+                    brand.code(), model.code(), variant.year(), variant.fuelCode());
+            FipeResponses.Price data = response.data();
+            if (data == null || data.vehicleType() != brand.type() || data.modelYear() != variant.year()
+                    || data.fipeCode() == null || data.fipeCode().isBlank()) {
+                throw new IllegalStateException("Inconsistent FIPE price response");
+            }
+            Matcher money = MONEY.matcher(data.value() == null ? "" : data.value());
+            if (!money.matches()) throw new IllegalStateException("Unknown FIPE monetary format: " + data.value());
+            BigDecimal value = new BigDecimal(money.group(1).replace(".", "") + "." + money.group(2));
+            repository.savePrice(period.id(), variant.id(), value, data.fipeCode(), response.raw(), Instant.now());
+            count.prices++;
+            progress.processed(jobId, true);
         }
-        Matcher money = MONEY.matcher(data.value() == null ? "" : data.value());
-        if (!money.matches()) throw new IllegalStateException("Unknown FIPE monetary format: " + data.value());
-        BigDecimal value = new BigDecimal(money.group(1).replace(".", "") + "." + money.group(2));
-        repository.savePrice(period.id(), variant.id(), value, data.fipeCode(), response.raw(), Instant.now());
-        count.prices++;
+    }
+
+    private Object resourceLock(String kind, long periodId, long id) {
+        return resourceLocks[Math.floorMod(java.util.Objects.hash(kind, periodId, id), resourceLocks.length)];
     }
 
     private boolean due(java.util.Optional<Instant> stamp, boolean refresh) {
@@ -311,8 +495,8 @@ public class SyncService implements DisposableBean {
 
     private static final class Counters {
         int brands, models, variants, prices;
-        SyncResult result(LocalDate month, String scope, int types) {
-            return new SyncResult(YearMonth.from(month).toString(), scope,
+        SyncResult result(long jobId, LocalDate month, String scope, int types) {
+            return new SyncResult(jobId, YearMonth.from(month).toString(), scope,
                     types, brands, models, variants, prices);
         }
     }

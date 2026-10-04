@@ -2,6 +2,16 @@
 
 Os exemplos de requisições estão em `request-collection/fipe-org/Example/`. As respostas dos cinco endpoints foram consultadas para julho/2026, com exemplos de carro, moto e caminhão; seus formatos observados e a estrutura das tabelas estão em [database.md](database.md). Esta página descreve o fluxo implementado em `sinc-service` para percorrer a FIPE, persistir resultados e consultar o histórico.
 
+## Carga inicial de catálogo (sem preços)
+
+`POST /sync/catalog` usa por padrão o período mais recente informado pela FIPE, os tipos `1`, `2`, `3` e `includeVariants=false`. Também aceita `referenceMonth` e `vehicleType` no corpo para restringir a consulta. O período mais recente vem da lista da FIPE, cujo resultado é mantido em cache de memória pelo tempo configurado; não se infere o código a partir do mês nem se assume que a ordem da resposta identifica o mais recente.
+
+Para cada tipo, listar marcas e modelos; salvar `brands`, `models`, `period_brands`, `period_models` e as respostas completas das listas. Se `includeVariants=true`, consultar `ConsultarAnoModelo` para cada modelo e persistir `model_variants`, `period_variants` e as listas de anos. **Não consultar preços** e **não** marcar `sync_runs` como concluído. A resposta `Anos` em `ConsultarModelos` é da marca e não autoriza associar cada ano a todos os modelos. A leitura do catálogo persistido fica a cargo da aplicação principal.
+
+Antes de enviar cada requisição à FIPE, o serviço verifica a lista persistida, inclusive listas vazias. Com `refreshOldRecords=false`, reutiliza as listas existentes; com `true`, reconsulta somente as que atingiram a idade mínima configurada. Assim uma segunda carga do mesmo período, tipo e nível de detalhe não repete as consultas de marcas/modelos/anos. A carga inicial pelo período mais recente é uma estratégia de cobertura ampla; não comprova a disponibilidade histórica em meses ainda não consultados.
+
+Uma sincronização de preços para o **mesmo período** reutiliza as listas de marcas e modelos cadastradas pela carga de catálogo; se `includeVariants=true`, reutiliza também as listas de variantes. Com `includeVariants=false`, precisa consultar os anos/combustíveis por modelo antes dos preços. Cada lista tem chave que inclui o período e só é reutilizada nesse período. Não se presume que marcas, modelos ou variantes estejam disponíveis em meses anteriores apenas por existirem no catálogo atual.
+
 ## Sincronização de um período
 
 Exemplo: solicitação de sincronização de **07/2026**.
@@ -13,6 +23,8 @@ Exemplo: solicitação de sincronização de **07/2026**.
 5. Para cada modelo, consultar `ConsultarAnoModelo` (`List Ano - Modelo.yml`) com período, tipo, marca e `codigoModelo`; salvar o retorno em `year_list_responses`, o `Value` original (por exemplo, `"2023-5"`) em `model_variants.source_value`, separar suas partes para os parâmetros `anoModelo` e `codigoTipoCombustivel` e salvar o `Label` em `period_variants.display_label`. Na amostra também houve `"32000-5"`, sem indicação textual do significado de `32000`.
 6. Para cada variante, consultar `ConsultarValorComTodosParametros` (`List All Info.yml`) com período, marca, modelo, tipo, `anoModelo`, `codigoTipoCombustivel`, `tipoVeiculo` e `tipoConsulta=tradicional`; salvar o preço e a resposta original em `vehicle_prices`.
 7. Marcar a tentativa daquele tipo como `completed` somente depois que todas as marcas, modelos, variantes e respectivos preços tiverem sido consultados com sucesso. Em caso de interrupção/erro, marcá-la como `failed`, conservando os dados parciais para retomada.
+
+Em paralelo, cada requisição `POST /sync/...` cria uma execução em `sync_jobs`. A sincronização mensal também cria três execuções filhas (uma por tipo). Eventos WebSocket e consultas `GET /sync/jobs` mostram etapa atual, marca/modelo, contadores de cotações descobertas e concluídas, e erros. Uma cotação já atualizada conta como `vehicles_skipped`, não como nova consulta FIPE. `remainingKnown` pode aumentar quando novos modelos são descobertos; só representa o restante exato quando `discoveryComplete=true`. Conexões posteriores recebem uma lista inicial de execuções ativas. Após reiniciar o serviço, execuções interrompidas passam a `failed` e mantêm os contadores registrados.
 
 `period_brands`, `period_models` e `period_variants` indicam que uma opção foi **listada**; `vehicle_prices` indica que seu **valor foi consultado**. A ausência de um registro de preço não prova que a FIPE não tinha valor: a coleta pode estar incompleta. Da mesma forma, a ausência de uma opção nas tabelas `period_*` não prova que ela não existia na FIPE até que a sincronização completa do tipo termine. `model_list_responses` preserva inclusive o array `Anos` devolvido junto aos modelos.
 

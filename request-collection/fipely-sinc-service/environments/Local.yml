@@ -3,6 +3,9 @@ variables:
   - name: baseurl
     value: http://localhost:8080/fipely-sinc-service/api/v1
     description: Endereço local da API de sincronização.
+  - name: wsbaseurl
+    value: ws://localhost:8080/fipely-sinc-service/api/v1
+    description: Endereço WebSocket da API (ws:// local; wss:// com TLS).
   - name: referenceMonth
     value: 2001-01
     description: Mês de referência no formato aaaa-MM (ou MM/aaaa).
@@ -24,6 +27,9 @@ variables:
   - name: refreshOldRecords
     value: "false"
     description: Reconsultar dados com pelo menos app.sync.min-age-days dias (padrão 365); só afeta os POST de sincronização.
+  - name: jobId
+    value: "8"
+    description: Substitua pelo jobId retornado no POST ou listado em GET /sync/jobs.
   - secret: true
     name: apiToken
     description: Preencha no Bruno com o mesmo valor de FIPELY_API_TOKEN usado para iniciar o serviço.

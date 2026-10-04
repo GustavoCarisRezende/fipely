@@ -1,11 +1,11 @@
 info:
-  name: Períodos incompletos por tipo de veículo
+  name: Progresso da execução por ID
   type: http
-  seq: 2
+  seq: 4
 
 http:
   method: GET
-  url: "{{baseurl}}/reports/periods/incomplete?refreshOldRecords={{refreshOldRecords}}"
+  url: "{{baseurl}}/sync/jobs/{{jobId}}?refreshOldRecords={{refreshOldRecords}}"
   headers:
     - name: X-API-Token
       value: "{{apiToken}}"

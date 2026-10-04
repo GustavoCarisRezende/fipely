@@ -4,7 +4,7 @@
 
 Este documento descreve **somente a estrutura dos dados**: tabelas, colunas, fontes, relações, restrições e índices. A ordem das requisições, a sincronização e as consultas de histórico estão em [fluxo.md](fluxo.md).
 
-Todas as tabelas pertencem ao schema PostgreSQL **`fipe`**. A migração executável aplicada na inicialização do serviço é `sinc-service/src/main/resources/db/migration/V1__fipe_schema.sql` (Flyway). O DDL abaixo é equivalente à migração; ela é a fonte canônica para novas instalações.
+Todas as tabelas pertencem ao schema PostgreSQL **`fipe`**. As migrações executáveis aplicadas na inicialização do serviço estão em `sinc-service/src/main/resources/db/migration/` (Flyway). O DDL abaixo documenta as estruturas; os arquivos V1 e V2 são as fontes canônicas para novas instalações.
 
 A fonte é a API de `veiculos.fipe.org.br`. Foram executadas as cinco requisições representadas em `request-collection/fipe-org/Example/`, usando o período **julho/2026** (`Codigo = 335`), incluindo amostras de carro, moto e caminhão. Os formatos descritos a seguir foram observados nessas respostas HTTP 200; não representam uma garantia para todo o histórico da API.
 
@@ -217,6 +217,22 @@ Registro de tentativas de coleta **completa** de um tipo de veículo em um mês.
 
 `running`, `completed` e `failed` são **estados internos propostos para o Fipely**, não valores observados na FIPE. O banco verifica os valores possíveis e a coerência entre estado e horário de término. O significado operacional de `completed` está descrito em [fluxo.md](fluxo.md).
 
+### `sync_jobs` — progresso de cada execução
+
+**Fonte:** dados internos produzidos pelo `sinc-service`, não pela FIPE. Uma linha por sincronização de período, marca, modelo, variante e por tipo de veículo dentro de um período completo. `parent_job_id` relaciona os três tipos ao trabalho mensal principal. Criada na migração `V2__sync_progress.sql`.
+
+| Coluna | Descrição |
+| --- | --- |
+| `id`, `parent_job_id` | ID da execução e, quando existir, da execução mensal pai. |
+| `scope`, `reference_month`, `vehicle_type`, `brand_code`, `model_code`, `model_year`, `fuel_code`, `refresh_old_records`, `include_variants` | Escopo e parâmetros que identificam o trabalho. `include_variants` foi adicionado na migração V3. |
+| `status`, `phase`, `current_brand`, `current_model` | Estado (`queued`, `running`, `completed`, `failed`) e atividade atual. |
+| `brands_discovered`, `models_discovered`, `vehicles_discovered` | Quantidades identificadas até o momento; `vehicles_discovered` é **parcial** até o término da descoberta. |
+| `vehicles_processed`, `vehicles_synced`, `vehicles_skipped` | Cotações concluídas, reconsultadas/inseridas e já atualizadas que foram aproveitadas. Uma cotação corresponde a uma variante em um período. |
+| `discovery_complete` | Indica quando o total descoberto deixa de ser parcial. |
+| `started_at`, `updated_at`, `finished_at`, `error_message` | Datas e eventual erro. |
+
+O endpoint calcula `remainingKnown = vehicles_discovered - vehicles_processed`. Para o trabalho mensal pai, os totais são a soma dos três filhos. **Não** interpretar `remainingKnown = 0` como fim do trabalho enquanto `discovery_complete = false`.
+
 ## DDL (PostgreSQL)
 
 O esquema abaixo usa tipos nativos do PostgreSQL e pode ser executado na ordem apresentada. Não pressupõe nenhuma extensão. Em instalações novas, prefira executar o serviço e deixar o Flyway aplicar a migração, em vez de executar os dois DDLs.
@@ -375,13 +391,61 @@ CREATE INDEX sync_runs_period_type_started_idx
     ON sync_runs (period_id, vehicle_type, started_at DESC);
 ```
 
+Migração V2 para o progresso (execute-a pelo Flyway, não manualmente sobre uma instalação já migrada):
+
+```sql
+CREATE TABLE fipe.sync_jobs (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    parent_job_id bigint REFERENCES fipe.sync_jobs (id),
+    scope text NOT NULL CHECK (scope IN ('period', 'vehicleType', 'brand', 'model', 'variant')),
+    reference_month date NOT NULL,
+    vehicle_type smallint CHECK (vehicle_type IN (1, 2, 3)),
+    brand_code text,
+    model_code integer,
+    model_year integer,
+    fuel_code text,
+    refresh_old_records boolean NOT NULL,
+    status text NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+    phase text NOT NULL,
+    current_brand text,
+    current_model text,
+    brands_discovered bigint NOT NULL DEFAULT 0 CHECK (brands_discovered >= 0),
+    models_discovered bigint NOT NULL DEFAULT 0 CHECK (models_discovered >= 0),
+    vehicles_discovered bigint NOT NULL DEFAULT 0 CHECK (vehicles_discovered >= 0),
+    vehicles_processed bigint NOT NULL DEFAULT 0 CHECK (vehicles_processed >= 0),
+    vehicles_synced bigint NOT NULL DEFAULT 0 CHECK (vehicles_synced >= 0),
+    vehicles_skipped bigint NOT NULL DEFAULT 0 CHECK (vehicles_skipped >= 0),
+    discovery_complete boolean NOT NULL DEFAULT false,
+    started_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    finished_at timestamptz,
+    error_message text,
+    CHECK (vehicles_processed <= vehicles_discovered),
+    CHECK (vehicles_synced + vehicles_skipped = vehicles_processed),
+    CHECK ((status IN ('queued', 'running') AND finished_at IS NULL)
+        OR (status IN ('completed', 'failed') AND finished_at IS NOT NULL))
+);
+
+CREATE INDEX sync_jobs_status_updated_idx ON fipe.sync_jobs (status, updated_at DESC);
+CREATE INDEX sync_jobs_parent_idx ON fipe.sync_jobs (parent_job_id);
+```
+
+Migração V3, necessária após a V2 para diferenciar a carga de catálogo dos preços:
+
+```sql
+ALTER TABLE fipe.sync_jobs DROP CONSTRAINT sync_jobs_scope_check;
+ALTER TABLE fipe.sync_jobs ADD CONSTRAINT sync_jobs_scope_check
+    CHECK (scope IN ('period', 'vehicleType', 'brand', 'model', 'variant', 'catalog', 'catalogType'));
+ALTER TABLE fipe.sync_jobs ADD COLUMN include_variants boolean NOT NULL DEFAULT false;
+```
+
 ## Limites das amostras e hipóteses do esquema
 
-As respostas efetivamente consultadas confirmam os formatos **dos exemplos acima**, não garantem que todas as respostas históricas usem os mesmos campos ou que não existam resultados vazios/erros. As chaves únicas por mês, marca, modelo e variante, o preço positivo e o registro de uma cotação por período/variante são **decisões de modelagem**, não propriedades comprovadas pela amostra. Antes de uma importação em massa, validar os formatos nas demais tabelas de referência e estabelecer o tratamento para respostas que não satisfaçam as restrições. A migração V1 já foi executada no PostgreSQL de desenvolvimento.
+As respostas efetivamente consultadas confirmam os formatos **dos exemplos acima**, não garantem que todas as respostas históricas usem os mesmos campos ou que não existam resultados vazios/erros. As chaves únicas por mês, marca, modelo e variante, o preço positivo e o registro de uma cotação por período/variante são **decisões de modelagem**, não propriedades comprovadas pela amostra. Antes de uma importação em massa, validar os formatos nas demais tabelas de referência e estabelecer o tratamento para respostas que não satisfaçam as restrições. A migração V3 é aplicada pelo Flyway ao iniciar o serviço atualizado.
 
 ## Limpar os dados para recomeçar
 
-**Atenção:** o comando abaixo apaga **todos os registros sincronizados e as tentativas de sincronização**. Execute-o somente conectado ao banco **`fipely`**, com o serviço de sincronização parado. Ele mantém as tabelas, índices, constraints e `fipe.flyway_schema_history`; não desfaz migrações. `RESTART IDENTITY` reinicia os IDs gerados automaticamente. Uma falha antes do `COMMIT` permite desfazer a transação com `ROLLBACK`.
+**Atenção:** o comando abaixo apaga **todos os registros sincronizados, tentativas e histórico de progresso**. Execute-o somente conectado ao banco **`fipely`**, com o serviço de sincronização parado. Ele mantém as tabelas, índices, constraints e `fipe.flyway_schema_history`; não desfaz migrações. `RESTART IDENTITY` reinicia os IDs gerados automaticamente. Uma falha antes do `COMMIT` permite desfazer a transação com `ROLLBACK`.
 
 ```sql
 BEGIN;
@@ -395,6 +459,7 @@ END
 $$;
 
 TRUNCATE TABLE
+    fipe.sync_jobs,
     fipe.vehicle_prices,
     fipe.period_variants,
     fipe.year_list_responses,

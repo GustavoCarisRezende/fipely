@@ -194,6 +194,19 @@ public class CatalogRepository {
                 periodId, variantId);
     }
 
+    public Optional<Instant> existingPriceStamp(LocalDate month, int type, String brandCode,
+                                                 int modelCode, int year, String fuelCode) {
+        return stamp("""
+                SELECT p.synced_at FROM fipe.vehicle_prices p
+                JOIN fipe.reference_periods r ON r.id=p.period_id
+                JOIN fipe.model_variants v ON v.id=p.variant_id
+                JOIN fipe.models m ON m.id=v.model_id
+                JOIN fipe.brands b ON b.id=m.brand_id
+                WHERE r.reference_month=? AND b.vehicle_type=? AND b.external_code=?
+                    AND m.external_code=? AND v.model_year=? AND v.fuel_code=?
+                """, month, type, brandCode, modelCode, year, fuelCode);
+    }
+
     public void savePrice(long periodId, long variantId, BigDecimal price, String fipeCode,
                           String json, Instant now) {
         jdbc.update("""

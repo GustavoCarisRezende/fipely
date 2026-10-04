@@ -1,0 +1,21 @@
+info:
+  name: Real Time Status
+  type: websocket
+  seq: 4
+
+websocket:
+  url: "{{wsbaseurl}}/sync/progress"
+  headers:
+    - name: X-API-Token
+      value: "{{apiToken}}"
+  message:
+    - title: message 1
+      selected: false
+      message:
+        type: json
+        data: ""
+  auth: inherit
+
+settings:
+  timeout: 0
+  keepAliveInterval: 0
