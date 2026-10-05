@@ -19,9 +19,18 @@ http:
     type: json
     data: |-
       {
+        "referenceMonth": "{{referenceMonth}}",
         "includeVariants": false
       }
   auth: inherit
+
+runtime:
+  scripts:
+    - type: after-response
+      code: |-
+        if (res.status === 202 && res.body?.jobId != null) {
+          bru.setVar('jobId', String(res.body.jobId));
+        }
 
 settings:
   encodeUrl: true

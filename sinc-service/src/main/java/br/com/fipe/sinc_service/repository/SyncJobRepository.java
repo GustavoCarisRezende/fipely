@@ -46,15 +46,29 @@ public class SyncJobRepository {
     public long create(String scope, java.time.LocalDate month, Integer vehicleType, String brandCode,
                        Integer modelCode, Integer modelYear, String fuelCode,
                        boolean refresh, boolean includeVariants, Long parentId, String status) {
-        return jdbc.queryForObject("""
+        Long inserted = jdbc.query("""
                 INSERT INTO fipe.sync_jobs
                     (parent_job_id, scope, reference_month, vehicle_type, brand_code,
                      model_code, model_year, fuel_code, refresh_old_records, include_variants, status, phase)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (scope, reference_month, vehicle_type, brand_code, model_code,
+                             model_year, fuel_code, refresh_old_records, include_variants)
+                    WHERE parent_job_id IS NULL AND status IN ('queued', 'running')
+                DO NOTHING
                 RETURNING id
-                """, Long.class, parentId, scope, month, vehicleType,
-                brandCode, modelCode, modelYear, fuelCode,
-                refresh, includeVariants, status, status.equals("queued") ? "waiting" : "referencePeriod");
+                """, rs -> rs.next() ? rs.getLong(1) : null, parentId, scope, month, vehicleType,
+                brandCode, modelCode, modelYear, fuelCode, refresh, includeVariants,
+                status, status.equals("queued") ? "waiting" : "referencePeriod");
+        if (inserted != null) return inserted;
+        return jdbc.queryForObject("""
+                SELECT id FROM fipe.sync_jobs WHERE parent_job_id IS NULL
+                  AND status IN ('queued','running') AND scope=? AND reference_month=?
+                  AND vehicle_type IS NOT DISTINCT FROM ? AND brand_code IS NOT DISTINCT FROM ?
+                  AND model_code IS NOT DISTINCT FROM ? AND model_year IS NOT DISTINCT FROM ?
+                  AND fuel_code IS NOT DISTINCT FROM ? AND refresh_old_records=? AND include_variants=?
+                ORDER BY id LIMIT 1
+                """, Long.class, scope, month, vehicleType, brandCode, modelCode, modelYear,
+                fuelCode, refresh, includeVariants);
     }
 
     public Optional<SyncProgress> find(long id) {
@@ -62,7 +76,9 @@ public class SyncJobRepository {
     }
 
     public List<SyncProgress> children(long parentId) {
-        return jdbc.query(SELECT + " WHERE parent_job_id=? ORDER BY id", JOB, parentId);
+        return jdbc.query(SELECT + " WHERE parent_job_id=? AND NOT (status='failed' AND error_message IN "
+                + "('Child job restarted; parent will resume safely','Child replaced during parent restart')) ORDER BY id",
+                JOB, parentId);
     }
 
     public List<SyncProgress> topLevel(String status, int limit) {
@@ -74,8 +90,46 @@ public class SyncJobRepository {
                 JOB, status, limit);
     }
 
+    public List<SyncProgress> resumable() {
+        return jdbc.query(SELECT + " WHERE parent_job_id IS NULL AND status='queued' ORDER BY id", JOB);
+    }
+
+    public List<SyncProgress> queued(int limit) {
+        return jdbc.query(SELECT + " WHERE parent_job_id IS NULL AND status='queued' ORDER BY id LIMIT ?", JOB, limit);
+    }
+
+    public Optional<Long> activeEquivalent(String scope, java.time.LocalDate month, Integer type, String brand,
+                                           Integer model, Integer year, String fuel, boolean refresh, boolean variants) {
+        return jdbc.query("""
+                SELECT id FROM fipe.sync_jobs WHERE parent_job_id IS NULL AND status IN ('queued','running')
+                    AND scope=? AND reference_month=? AND vehicle_type IS NOT DISTINCT FROM ?
+                    AND brand_code IS NOT DISTINCT FROM ? AND model_code IS NOT DISTINCT FROM ?
+                    AND model_year IS NOT DISTINCT FROM ? AND fuel_code IS NOT DISTINCT FROM ?
+                    AND refresh_old_records=? AND include_variants=? ORDER BY id LIMIT 1
+                """, (rs, row) -> rs.getLong(1), scope, month, type, brand, model, year, fuel, refresh, variants)
+                .stream().findFirst();
+    }
+
+    public void requeue(long id, String reason) {
+        jdbc.update("""
+                UPDATE fipe.sync_jobs SET status='queued', phase='waiting', finished_at=NULL,
+                    updated_at=now(), error_message=? WHERE id=? AND status IN ('queued','running')
+                """, reason, id);
+    }
+
     public void start(long id) {
         jdbc.update("UPDATE fipe.sync_jobs SET status='running', phase='referencePeriod', updated_at=now() WHERE id=?", id);
+    }
+
+    public void beginRoot(long id) {
+        jdbc.update("""
+                UPDATE fipe.sync_jobs SET status='running', phase='referencePeriod',
+                    brands_discovered=0, models_discovered=0, vehicles_discovered=0,
+                    vehicles_processed=0, vehicles_synced=0, vehicles_skipped=0,
+                    discovery_complete=false, current_brand=NULL, current_model=NULL,
+                    finished_at=NULL, error_message=NULL, updated_at=now()
+                WHERE id=? AND parent_job_id IS NULL
+                """, id);
     }
 
     public void activity(long id, String phase, Integer type, String brand, String model) {
@@ -94,17 +148,33 @@ public class SyncJobRepository {
                 """, brands, models, vehicles, id);
     }
 
+    /** One atomic write for all buffered progress deltas. */
+    public void progressDelta(long id, long brands, long models, long vehicles,
+                              long processed, long synced) {
+        if (brands == 0 && models == 0 && vehicles == 0 && processed == 0) return;
+        jdbc.update("""
+                UPDATE fipe.sync_jobs SET brands_discovered=brands_discovered+?,
+                    models_discovered=models_discovered+?, vehicles_discovered=vehicles_discovered+?,
+                    vehicles_processed=vehicles_processed+?, vehicles_synced=vehicles_synced+?,
+                    vehicles_skipped=vehicles_skipped+?, updated_at=now() WHERE id=?
+                """, brands, models, vehicles, processed, synced, processed - synced, id);
+    }
+
     public void processed(long id, boolean fetched) {
         processedBatch(id, 1, fetched);
     }
 
     public void processedBatch(long id, long quantity, boolean fetched) {
+        processedBatch(id, quantity, fetched ? quantity : 0);
+    }
+
+    public void processedBatch(long id, long quantity, long synced) {
         if (quantity == 0) return;
         jdbc.update("""
                 UPDATE fipe.sync_jobs SET vehicles_processed=vehicles_processed+?,
                     vehicles_synced=vehicles_synced+?, vehicles_skipped=vehicles_skipped+?,
                     updated_at=now() WHERE id=?
-                """, quantity, fetched ? quantity : 0, fetched ? 0 : quantity, id);
+                """, quantity, synced, quantity - synced, id);
     }
 
     public void discoveryComplete(long id) {
@@ -119,13 +189,25 @@ public class SyncJobRepository {
                 """, status, status, status, error, id);
     }
 
-    public void failInterrupted() {
+    public void requeueInterrupted() {
         jdbc.update("""
-                UPDATE fipe.sync_jobs SET status='failed', phase='failed',
-                    finished_at=now(), updated_at=now(),
-                    error_message='Service restarted before sync completion'
-                WHERE status IN ('queued', 'running')
+                UPDATE fipe.sync_jobs SET status='queued', phase='waiting',
+                    finished_at=NULL, updated_at=now(), error_message=NULL
+                WHERE parent_job_id IS NULL AND status='running'
                 """);
+        jdbc.update("""
+                UPDATE fipe.sync_jobs SET status='failed', phase='failed', finished_at=now(),
+                    updated_at=now(), error_message='Child job restarted; parent will resume safely'
+                WHERE parent_job_id IS NOT NULL AND status IN ('queued', 'running')
+                """);
+    }
+
+    public void restartChildren(long parentId) {
+        jdbc.update("""
+                UPDATE fipe.sync_jobs SET status='failed', phase='failed', finished_at=now(),
+                updated_at=now(), error_message='Child replaced during parent restart'
+                WHERE parent_job_id=?
+                """, parentId);
     }
 
     public void failQueuedChildren(long parentId, String error) {

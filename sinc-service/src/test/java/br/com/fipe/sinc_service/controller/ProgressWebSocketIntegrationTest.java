@@ -22,14 +22,21 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.math.BigDecimal;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.ContextConfiguration;
+import br.com.fipe.sinc_service.TestDatabaseSafetyInitializer;
+import br.com.fipe.sinc_service.repository.CatalogRepository;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(initializers = TestDatabaseSafetyInitializer.class)
 class ProgressWebSocketIntegrationTest {
     @LocalServerPort
     private int port;
@@ -42,6 +49,56 @@ class ProgressWebSocketIntegrationTest {
 
     @Autowired
     private JdbcTemplate jdbc;
+
+    @Autowired
+    private CatalogRepository catalog;
+
+    @Test
+    void httpSubmissionReturns202AndProgressEndpointReachesTerminalStateWithoutFipeCalls() throws Exception {
+        LocalDate month = LocalDate.of(2026, 7, 1);
+        var period = catalog.savePeriod(55901, "julho/2026", month);
+        var now = java.time.Instant.now();
+        var brand = catalog.saveBrand(2, "test-http-brand", "TEST", now);
+        catalog.savePeriodBrand(period.id(), brand.id(), "TEST", now);
+        var model = catalog.saveModel(brand.id(), 55901, "test-http-model", now);
+        catalog.savePeriodModel(period.id(), brand.id(), model.id(), "TEST MODEL", now);
+        var variant = catalog.saveVariant(model.id(), "55901-5", 2023, "5", now);
+        catalog.savePeriodVariant(period.id(), model.id(), variant.id(), "2023 Flex", now);
+        catalog.savePrice(period.id(), variant.id(), new BigDecimal("12000.00"), "TEST-55901", "{}", now);
+
+        HttpClient client = HttpClient.newHttpClient();
+        String root = "http://127.0.0.1:" + port + "/fipely-sinc-service/api/v1/sync";
+        String body = "{\"referenceMonth\":\"2026-07\",\"vehicleType\":2,\"brandCode\":\"test-http-brand\","
+                + "\"modelCode\":55901,\"modelYear\":2023,\"fuelCode\":\"5\"}";
+        HttpResponse<String> accepted = client.send(HttpRequest.newBuilder(URI.create(root + "/variants"))
+                .header("X-API-Token", token).header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body)).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(202, accepted.statusCode());
+        long jobId = new tools.jackson.databind.ObjectMapper().readTree(accepted.body()).get("jobId").asLong();
+
+        String progressUrl = root + "/jobs/" + jobId;
+        String status = "queued";
+        for (int attempt = 0; attempt < 50 && !status.equals("completed"); attempt++) {
+            HttpResponse<String> response = client.send(HttpRequest.newBuilder(URI.create(progressUrl))
+                    .header("X-API-Token", token).GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, response.statusCode());
+            status = new tools.jackson.databind.ObjectMapper().readTree(response.body()).get("status").asString();
+            if (!status.equals("completed")) Thread.sleep(20);
+        }
+        assertEquals("completed", status);
+
+        jdbc.update("DELETE FROM fipe.vehicle_prices WHERE period_id=?", period.id());
+        jdbc.update("DELETE FROM fipe.period_variants WHERE period_id=?", period.id());
+        jdbc.update("DELETE FROM fipe.year_list_responses WHERE period_id=?", period.id());
+        jdbc.update("DELETE FROM fipe.period_models WHERE period_id=?", period.id());
+        jdbc.update("DELETE FROM fipe.model_list_responses WHERE period_id=?", period.id());
+        jdbc.update("DELETE FROM fipe.period_brands WHERE period_id=?", period.id());
+        jdbc.update("DELETE FROM fipe.brand_list_responses WHERE period_id=?", period.id());
+        jdbc.update("DELETE FROM fipe.reference_periods WHERE id=?", period.id());
+        jdbc.update("DELETE FROM fipe.model_variants WHERE model_id=?", model.id());
+        jdbc.update("DELETE FROM fipe.models WHERE id=?", model.id());
+        jdbc.update("DELETE FROM fipe.brands WHERE id=?", brand.id());
+    }
 
     @Test
     void browserSubprotocolAndHeaderBothReceiveSnapshotButAnonymousHandshakeFails() throws Exception {

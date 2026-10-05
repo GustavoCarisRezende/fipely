@@ -53,6 +53,14 @@ class SyncServiceTest {
         when(repository.brands(1, 2)).thenReturn(List.of(brand));
         when(repository.models(1, 2)).thenReturn(List.of(model));
         when(repository.variants(1, 3)).thenReturn(List.of(variant));
+        when(repository.freshPriceVariantIds(Mockito.anyLong(), Mockito.anyLong(), Mockito.any(), Mockito.anyBoolean()))
+                .thenReturn(java.util.Set.of());
+        when(repository.persistBrandResponse(Mockito.anyLong(), Mockito.anyInt(), Mockito.anyList(), Mockito.anyString(), Mockito.any()))
+                .thenReturn(List.of(new Catalog.Brand(2, 2, "80", "HONDA", Instant.now())));
+        when(repository.persistModelResponse(Mockito.anyLong(), Mockito.anyLong(), Mockito.anyList(), Mockito.anyString(), Mockito.any()))
+                .thenReturn(List.of(new Catalog.Model(3, 2, 10378, "CB 300F", Instant.now())));
+        when(repository.persistYearResponse(Mockito.anyLong(), Mockito.anyLong(), Mockito.anyList(), Mockito.anyString(), Mockito.any()))
+                .thenReturn(List.of(new Catalog.Variant(4, 3, "2023-5", 2023, "5", Instant.now())));
     }
 
     @AfterEach
@@ -68,6 +76,21 @@ class SyncServiceTest {
         assertEquals(0, service.sync(SyncService.Scope.VARIANT, request, false).prices());
         assertEquals(1, service.sync(SyncService.Scope.VARIANT, request, true).prices());
         verify(client, Mockito.times(1)).price(335, 2, "80", 10378, 2023, "5");
+    }
+
+    @Test
+    void modelSyncBulkSkipsFreshPricesAndCountsThemTogether() {
+        when(repository.freshPriceVariantIds(Mockito.eq(1L), Mockito.eq(3L), Mockito.any(), Mockito.eq(false)))
+                .thenReturn(java.util.Set.of(4L));
+
+        SyncResult result = service.sync(SyncService.Scope.MODEL, request, false);
+
+        assertEquals(0, result.prices());
+        verify(repository).freshPriceVariantIds(Mockito.eq(1L), Mockito.eq(3L), Mockito.any(), Mockito.eq(false));
+        verify(progress).processedBatch(Mockito.anyLong(), Mockito.eq(1L), Mockito.eq(false));
+        verify(repository, never()).priceStamp(1, 4);
+        verify(client, never()).price(Mockito.anyInt(), Mockito.anyInt(), Mockito.anyString(),
+                Mockito.anyInt(), Mockito.anyInt(), Mockito.anyString());
     }
 
     @Test
@@ -169,12 +192,12 @@ class SyncServiceTest {
         when(repository.yearListStamp(1, 3)).thenReturn(Optional.empty());
         Mockito.doAnswer(invocation -> {
             brandsSaved.set(Optional.of(Instant.now()));
-            return null;
-        }).when(repository).saveBrandList(Mockito.eq(1L), Mockito.eq(2), Mockito.anyString(), Mockito.any());
+            return List.of(new Catalog.Brand(2, 2, "80", "HONDA", Instant.now()));
+        }).when(repository).persistBrandResponse(Mockito.eq(1L), Mockito.eq(2), Mockito.anyList(), Mockito.anyString(), Mockito.any());
         Mockito.doAnswer(invocation -> {
             modelsSaved.set(Optional.of(Instant.now()));
-            return null;
-        }).when(repository).saveModelList(Mockito.eq(1L), Mockito.eq(2L), Mockito.anyString(), Mockito.any());
+            return List.of(new Catalog.Model(3, 2, 10378, "CB 300F", Instant.now()));
+        }).when(repository).persistModelResponse(Mockito.eq(1L), Mockito.eq(2L), Mockito.anyList(), Mockito.anyString(), Mockito.any());
         when(client.brands(335, 2)).thenReturn(new FipeClient.Response<>(
                 List.of(new FipeResponses.Option("HONDA", "80")), "[]"));
         when(client.models(335, 2, "80")).thenReturn(new FipeClient.Response<>(
@@ -258,7 +281,7 @@ class SyncServiceTest {
         verify(client).years(334, 2, "80", 10378);
         verify(client).price(334, 2, "80", 10378, 2023, "5");
         verify(client, never()).brands(335, 2);
-        verify(repository).saveBrandList(Mockito.eq(8L), Mockito.eq(2), Mockito.anyString(), Mockito.any());
+        verify(repository).persistBrandResponse(Mockito.eq(8L), Mockito.eq(2), Mockito.anyList(), Mockito.anyString(), Mockito.any());
     }
 
     @Test
@@ -336,8 +359,8 @@ class SyncServiceTest {
         });
         Mockito.doAnswer(invocation -> {
             stamp.set(Optional.of(Instant.now()));
-            return null;
-        }).when(repository).saveBrandList(Mockito.eq(1L), Mockito.eq(2), Mockito.anyString(), Mockito.any());
+            return List.of();
+        }).when(repository).persistBrandResponse(Mockito.eq(1L), Mockito.eq(2), Mockito.anyList(), Mockito.anyString(), Mockito.any());
 
         CompletableFuture<SyncResult> first = CompletableFuture.supplyAsync(() ->
                 service.syncCatalog(new CatalogSyncRequest("2026-07", 2, false), false));

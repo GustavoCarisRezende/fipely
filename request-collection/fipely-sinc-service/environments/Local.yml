@@ -28,8 +28,8 @@ variables:
     value: "false"
     description: Reconsultar dados com pelo menos app.sync.min-age-days dias (padrão 365); só afeta os POST de sincronização.
   - name: jobId
-    value: "8"
-    description: Substitua pelo jobId retornado no POST ou listado em GET /sync/jobs.
+    value: ""
+    description: Definido automaticamente após um POST de sincronização; também pode ser preenchido manualmente com um ID de GET /sync/jobs.
   - secret: true
     name: apiToken
     description: Preencha no Bruno com o mesmo valor de FIPELY_API_TOKEN usado para iniciar o serviço.

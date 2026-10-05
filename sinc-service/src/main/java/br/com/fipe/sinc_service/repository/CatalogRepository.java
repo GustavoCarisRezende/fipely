@@ -7,14 +7,21 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.ArrayList;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 @Repository
 public class CatalogRepository {
+    public record BrandInput(String code, String name) {}
+    public record ModelInput(int code, String name) {}
+    public record VariantInput(String sourceValue, int year, String fuel, String label) {}
     public record PriceHistory(LocalDate referenceMonth, int modelYear, String fuelCode,
                                String label, String fipeCode, BigDecimal priceBrl,
                                Instant syncedAt, JsonNode rawResponse) {}
@@ -87,6 +94,25 @@ public class CatalogRepository {
                 """, periodId, type, json, Timestamp.from(now));
     }
 
+    @Transactional
+    public List<Catalog.Brand> persistBrandResponse(long periodId, int type, List<BrandInput> inputs,
+                                                    String raw, Instant now) {
+        List<Catalog.Brand> result = new ArrayList<>();
+        List<Object[]> links = new ArrayList<>();
+        for (BrandInput input : inputs) {
+            Catalog.Brand brand = saveBrand(type, input.code(), input.name(), now);
+            result.add(brand);
+            links.add(new Object[]{periodId, brand.id(), input.name(), Timestamp.from(now)});
+        }
+        jdbc.batchUpdate("""
+                INSERT INTO fipe.period_brands (period_id, brand_id, display_name, synced_at)
+                VALUES (?, ?, ?, ?) ON CONFLICT (period_id, brand_id) DO UPDATE
+                SET display_name=EXCLUDED.display_name, synced_at=EXCLUDED.synced_at
+                """, links);
+        saveBrandList(periodId, type, raw, now); // stamp is the final write in this transaction
+        return result;
+    }
+
     public Catalog.Brand saveBrand(int type, String code, String name, Instant now) {
         long id = jdbc.queryForObject("""
                 INSERT INTO fipe.brands (vehicle_type, external_code, name, synced_at)
@@ -123,6 +149,25 @@ public class CatalogRepository {
                 VALUES (?, ?, CAST(? AS jsonb), ?) ON CONFLICT (period_id, brand_id) DO UPDATE
                 SET raw_response=EXCLUDED.raw_response, synced_at=EXCLUDED.synced_at
                 """, periodId, brandId, json, Timestamp.from(now));
+    }
+
+    @Transactional
+    public List<Catalog.Model> persistModelResponse(long periodId, long brandId, List<ModelInput> inputs,
+                                                     String raw, Instant now) {
+        List<Catalog.Model> result = new ArrayList<>();
+        List<Object[]> links = new ArrayList<>();
+        for (ModelInput input : inputs) {
+            Catalog.Model model = saveModel(brandId, input.code(), input.name(), now);
+            result.add(model);
+            links.add(new Object[]{periodId, brandId, model.id(), input.name(), Timestamp.from(now)});
+        }
+        jdbc.batchUpdate("""
+                INSERT INTO fipe.period_models (period_id, brand_id, model_id, display_name, synced_at)
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT (period_id, model_id) DO UPDATE
+                SET display_name=EXCLUDED.display_name, synced_at=EXCLUDED.synced_at
+                """, links);
+        saveModelList(periodId, brandId, raw, now);
+        return result;
     }
 
     public Catalog.Model saveModel(long brandId, int code, String name, Instant now) {
@@ -163,6 +208,25 @@ public class CatalogRepository {
                 """, periodId, modelId, json, Timestamp.from(now));
     }
 
+    @Transactional
+    public List<Catalog.Variant> persistYearResponse(long periodId, long modelId, List<VariantInput> inputs,
+                                                      String raw, Instant now) {
+        List<Catalog.Variant> result = new ArrayList<>();
+        List<Object[]> links = new ArrayList<>();
+        for (VariantInput input : inputs) {
+            Catalog.Variant variant = saveVariant(modelId, input.sourceValue(), input.year(), input.fuel(), now);
+            result.add(variant);
+            links.add(new Object[]{periodId, modelId, variant.id(), input.label(), Timestamp.from(now)});
+        }
+        jdbc.batchUpdate("""
+                INSERT INTO fipe.period_variants (period_id, model_id, variant_id, display_label, synced_at)
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT (period_id, variant_id) DO UPDATE
+                SET display_label=EXCLUDED.display_label, synced_at=EXCLUDED.synced_at
+                """, links);
+        saveYearList(periodId, modelId, raw, now);
+        return result;
+    }
+
     public Catalog.Variant saveVariant(long modelId, String sourceValue, int year, String fuel, Instant now) {
         long id = jdbc.queryForObject("""
                 INSERT INTO fipe.model_variants (model_id, source_value, model_year, fuel_code, synced_at)
@@ -192,6 +256,15 @@ public class CatalogRepository {
     public Optional<Instant> priceStamp(long periodId, long variantId) {
         return stamp("SELECT synced_at FROM fipe.vehicle_prices WHERE period_id=? AND variant_id=?",
                 periodId, variantId);
+    }
+
+    /** Existing prices that need no refresh, fetched in one roundtrip for the model. */
+    public Set<Long> freshPriceVariantIds(long periodId, long modelId, Instant cutoff, boolean refresh) {
+        return new HashSet<>(jdbc.query("""
+                SELECT pv.variant_id FROM fipe.period_variants pv
+                JOIN fipe.vehicle_prices p ON p.period_id=pv.period_id AND p.variant_id=pv.variant_id
+                WHERE pv.period_id=? AND pv.model_id=? AND (?=false OR p.synced_at > ?)
+                """, (rs, row) -> rs.getLong(1), periodId, modelId, refresh, Timestamp.from(cutoff)));
     }
 
     public Optional<Instant> existingPriceStamp(LocalDate month, int type, String brandCode,

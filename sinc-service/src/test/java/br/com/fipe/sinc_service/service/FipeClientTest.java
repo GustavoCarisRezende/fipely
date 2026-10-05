@@ -88,6 +88,65 @@ class FipeClientTest {
         assertEquals(1, calls.get());
     }
 
+    @Test
+    void retriesServerErrorsButDoesNotExposeResponseBody() {
+        AtomicInteger calls = new AtomicInteger();
+        server.createContext("/ConsultarMarcas", exchange -> {
+            if (calls.incrementAndGet() == 1) reply(exchange, 503, "private response contents");
+            else reply(exchange, 200, "[{\"Label\":\"HONDA\",\"Value\":\"80\"}]");
+        });
+        server.start();
+        FipeClient client = new FipeClient(new ObjectMapper(), base, 0, 2, 0, 5);
+        assertEquals(1, client.brands(335, 2).data().size());
+        assertEquals(2, calls.get());
+    }
+
+    @Test
+    void recoversAdaptiveIntervalAfterConsecutiveSuccessesWithoutCrossingMinimum() {
+        AtomicInteger calls = new AtomicInteger();
+        server.createContext("/ConsultarMarcas", exchange -> {
+            if (calls.incrementAndGet() == 1) reply(exchange, 429, "limited");
+            else reply(exchange, 200, "[]");
+        });
+        server.start();
+        FipeClient client = new FipeClient(new ObjectMapper(), base, 0, 2, 0, 5);
+        assertEquals(0, client.currentRateLimitIntervalMs());
+        client.brands(1, 1);
+        assertEquals(1, client.currentRateLimitIntervalMs());
+        for (int i = 0; i < 5; i++) client.brands(1, 1);
+        assertEquals(0, client.currentRateLimitIntervalMs());
+    }
+
+    @Test
+    void failsWithoutRetryWhenRetryAfterExceedsConfiguredCeiling() {
+        AtomicInteger calls = new AtomicInteger();
+        server.createContext("/ConsultarMarcas", exchange -> {
+            calls.incrementAndGet();
+            exchange.getResponseHeaders().add("Retry-After", "2");
+            reply(exchange, 429, "limited");
+        });
+        server.start();
+        FipeClient client = new FipeClient(new ObjectMapper(), base, 0, 3, 0, 5, 1_000, 1_000);
+        IllegalStateException error = assertThrows(IllegalStateException.class, () -> client.brands(1, 1));
+        assertEquals("FIPE Retry-After exceeds configured safe limit", error.getMessage());
+        assertEquals(1, calls.get());
+    }
+
+    @Test
+    void honorsRetryAfterWhenWithinConfiguredCeiling() {
+        AtomicInteger calls = new AtomicInteger();
+        server.createContext("/ConsultarMarcas", exchange -> {
+            if (calls.incrementAndGet() == 1) {
+                exchange.getResponseHeaders().add("Retry-After", "0");
+                reply(exchange, 429, "limited");
+            } else reply(exchange, 200, "[]");
+        });
+        server.start();
+        FipeClient client = new FipeClient(new ObjectMapper(), base, 0, 2, 0, 5, 1_000, 1_000);
+        assertEquals(0, client.brands(1, 1).data().size());
+        assertEquals(2, calls.get());
+    }
+
     private static void reply(com.sun.net.httpserver.HttpExchange exchange, int code, String body)
             throws IOException {
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);

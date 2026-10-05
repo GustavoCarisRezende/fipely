@@ -21,14 +21,26 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.core.annotation.Order;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ResponseStatusException;
 
 @Service
 public class SyncService implements DisposableBean {
@@ -43,6 +55,7 @@ public class SyncService implements DisposableBean {
     private final CatalogRepository repository;
     private final FipeClient client;
     private final SyncProgressService progress;
+    private final SingleInstanceJobGuard jobGuard;
     private final int ageDays;
     private final long referencePeriodCacheMinutes;
     private volatile CachedPeriods periodsCache;
@@ -50,21 +63,53 @@ public class SyncService implements DisposableBean {
     // Bounded striped locks prevent overlapping scopes from fetching the same FIPE resource.
     private final Object[] resourceLocks = new Object[256];
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    private final ThreadPoolExecutor dispatcher;
+    private final ThreadPoolExecutor periodDispatcher;
+    private final int totalQueueWorkers;
+    private final int totalQueueCapacity;
+    private final ConcurrentMap<String, Long> activeKeys = new ConcurrentHashMap<>();
+    private final Set<Long> scheduledIds = ConcurrentHashMap.newKeySet();
+    private final ScheduledExecutorService recovery = Executors.newSingleThreadScheduledExecutor();
+    private volatile boolean accepting = true;
     private final ConcurrentHashMap<String, CompletableFuture<SyncResult>> jobs = new ConcurrentHashMap<>();
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(SyncService.class);
 
+    @Autowired
     public SyncService(CatalogRepository repository, FipeClient client, SyncProgressService progress,
                        @Value("${app.sync.min-age-days:365}") int ageDays,
                        @Value("${app.fipe.max-concurrent-syncs:2}") int threads,
-                       @Value("${app.fipe.reference-period-cache-minutes:1440}") long cacheMinutes) {
-        if (ageDays < 1 || threads < 1 || cacheMinutes < 1)
+                       @Value("${app.fipe.reference-period-cache-minutes:1440}") long cacheMinutes,
+                       @Value("${app.sync.queue-workers:2}") int queueWorkers,
+                       @Value("${app.sync.queue-capacity:48}") int queueCapacity,
+                       SingleInstanceJobGuard jobGuard) {
+        if (ageDays < 1 || threads < 1 || cacheMinutes < 1 || queueWorkers < 2 || queueCapacity < 1)
             throw new IllegalArgumentException("Invalid sync configuration");
         this.repository = repository;
         this.client = client;
         this.progress = progress;
+        this.jobGuard = jobGuard;
         this.ageDays = ageDays;
         this.referencePeriodCacheMinutes = cacheMinutes;
+        this.totalQueueWorkers = queueWorkers;
+        this.totalQueueCapacity = queueCapacity;
+        this.dispatcher = new ThreadPoolExecutor(Math.max(1, queueWorkers - 1), Math.max(1, queueWorkers - 1), 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(queueCapacity), Thread.ofPlatform().name("sync-dispatch-", 0).factory(),
+                new ThreadPoolExecutor.AbortPolicy());
+        this.periodDispatcher = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(queueCapacity), Thread.ofPlatform().name("sync-period-", 0).factory(),
+                new ThreadPoolExecutor.AbortPolicy());
         this.concurrency = new Semaphore(threads);
         for (int i = 0; i < resourceLocks.length; i++) resourceLocks[i] = new Object();
+    }
+
+    SyncService(CatalogRepository repository, FipeClient client, SyncProgressService progress,
+                int ageDays, int threads, long cacheMinutes, int queueWorkers, int queueCapacity) {
+        this(repository, client, progress, ageDays, threads, cacheMinutes, queueWorkers, queueCapacity, null);
+    }
+
+    SyncService(CatalogRepository repository, FipeClient client, SyncProgressService progress,
+                int ageDays, int threads, long cacheMinutes) {
+        this(repository, client, progress, ageDays, threads, cacheMinutes, 2, 48);
     }
 
     public SyncResult sync(Scope scope, SyncRequest request, boolean refreshOldRecords) {
@@ -77,6 +122,146 @@ public class SyncService implements DisposableBean {
         if (scope == Scope.PERIOD) return await(sharedFuture(key,
                 () -> runJob(scope, month, request, refreshOldRecords), false));
         return await(sharedFuture(key, () -> runJob(scope, month, request, refreshOldRecords), true));
+    }
+
+    public record Accepted(long jobId, String status) {}
+
+    public Accepted submit(Scope scope, SyncRequest request, boolean refresh) {
+        validate(scope, request);
+        YearMonth month = parseMonth(request.referenceMonth());
+        String key = scope + ":" + month + ":" + request.vehicleType() + ":" + request.brandCode()
+                + ":" + request.modelCode() + ":" + request.modelYear() + ":" + request.fuelCode() + ":" + refresh;
+        return submit(key, () -> progress.enqueue(scope.name().toLowerCase(Locale.ROOT), request,
+                month.atDay(1), refresh), id -> runExistingJob(scope, month, request, refresh, id),
+                () -> progress.activeEquivalent(scope.name().toLowerCase(Locale.ROOT), month.atDay(1),
+                        request.vehicleType(), request.brandCode(), request.modelCode(), request.modelYear(),
+                        request.fuelCode(), refresh, false));
+    }
+
+    public Accepted submitCatalog(CatalogSyncRequest body, boolean refresh) {
+        CatalogSyncRequest request = body == null ? new CatalogSyncRequest(null, null, null) : body;
+        if (request.vehicleType() != null && (request.vehicleType() < 1 || request.vehicleType() > 3))
+            throw new IllegalArgumentException("vehicleType must be 1..3");
+        YearMonth month;
+        if (request.referenceMonth() == null || request.referenceMonth().isBlank()) {
+            // Never make the HTTP request wait on the external FIPE period endpoint.
+            month = repository.localMonths().stream().map(YearMonth::from).max(YearMonth::compareTo)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                            "No local reference month; provide referenceMonth explicitly"));
+            request = new CatalogSyncRequest(month.toString(), request.vehicleType(), request.includeVariants());
+        } else month = parseMonth(request.referenceMonth());
+        String key = "catalog:" + month + ":" + request.vehicleType() + ":" + request.variantsRequested() + ":" + refresh;
+        YearMonth resolvedMonth = month;
+        CatalogSyncRequest resolvedRequest = request;
+        return submit(key, () -> progress.enqueueCatalog(resolvedRequest, resolvedMonth.atDay(1), refresh),
+                id -> runExistingCatalog(resolvedRequest, resolvedMonth, refresh, id),
+                () -> progress.activeEquivalent("catalog", resolvedMonth.atDay(1), resolvedRequest.vehicleType(),
+                        null, null, null, null, refresh, resolvedRequest.variantsRequested()));
+    }
+
+    private synchronized Accepted submit(String key, java.util.function.LongSupplier create,
+                                         java.util.function.LongConsumer work,
+                                         Supplier<java.util.Optional<Long>> activeLookup) {
+        if (!accepting) throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Service is stopping");
+        Long existing = activeKeys.get(key);
+        if (existing != null) return new Accepted(existing, progress.find(existing).status());
+        var equivalent = activeLookup.get();
+        if (equivalent.isPresent()) {
+            long existingId = equivalent.get();
+            var current = progress.find(existingId);
+            if (current.status().equals("queued")) dispatchExisting(current);
+            return new Accepted(existingId, current.status());
+        }
+        boolean broad = key.startsWith("PERIOD:") || key.startsWith("catalog:");
+        if (!hasCapacity(broad))
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Sync queue is full");
+        long id = create.getAsLong(); // durable before the request can receive 202
+        if (!dispatch(key, id, work, broad)) {
+            progress.finish(id, "failed", "Sync queue is full");
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Sync queue is full");
+        }
+        return new Accepted(id, "queued");
+    }
+
+    private synchronized boolean dispatch(String key, long id, java.util.function.LongConsumer work, boolean broad) {
+        if (!scheduledIds.add(id)) return true;
+        activeKeys.put(key, id);
+        try {
+            (broad ? periodDispatcher : dispatcher).execute(() -> {
+                try { work.accept(id); }
+                catch (RuntimeException failure) {
+                    logWorkerFailure(id, failure);
+                    try { progress.requeue(id, "Worker failed before terminal state; scheduled for retry"); }
+                    catch (RuntimeException persistFailure) { failure.addSuppressed(persistFailure); logWorkerFailure(id, failure); }
+                } finally {
+                    scheduledIds.remove(id);
+                    activeKeys.remove(key, id);
+                }
+            });
+            return true;
+        } catch (RejectedExecutionException full) {
+            activeKeys.remove(key, id);
+            scheduledIds.remove(id);
+            return false;
+        }
+    }
+
+    private void dispatchExisting(br.com.fipe.sinc_service.dto.SyncProgress job) {
+        String key = key(job);
+        java.util.function.LongConsumer work;
+        if (job.scope().equals("catalog")) {
+            var request = new CatalogSyncRequest(job.referenceMonth().toString(), job.vehicleType(), job.includeVariants());
+            work = id -> runExistingCatalog(request, YearMonth.from(job.referenceMonth()), job.refreshOldRecords(), id);
+        } else {
+            Scope scope = Scope.valueOf(job.scope().toUpperCase(Locale.ROOT));
+            var request = new SyncRequest(job.referenceMonth().toString(), job.vehicleType(), job.brandCode(),
+                    job.modelCode(), job.modelYear(), job.fuelCode());
+            work = id -> runExistingJob(scope, YearMonth.from(job.referenceMonth()), request, job.refreshOldRecords(), id);
+        }
+        dispatch(key, job.jobId(), work, job.scope().equals("period") || job.scope().equals("catalog"));
+    }
+
+    private static String key(br.com.fipe.sinc_service.dto.SyncProgress job) {
+        if (job.scope().equals("catalog")) return "catalog:" + job.referenceMonth() + ":" + job.vehicleType()
+                + ":" + job.includeVariants() + ":" + job.refreshOldRecords();
+        return Scope.valueOf(job.scope().toUpperCase(Locale.ROOT)) + ":" + job.referenceMonth() + ":"
+                + job.vehicleType() + ":" + job.brandCode() + ":" + job.modelCode() + ":" + job.modelYear()
+                + ":" + job.fuelCode() + ":" + job.refreshOldRecords();
+    }
+
+    private static void logWorkerFailure(long id, RuntimeException error) {
+        log.error("Sync worker failed for job {} ({})", id, error.getClass().getSimpleName());
+    }
+
+    @EventListener(ApplicationReadyEvent.class)
+    @Order(2)
+    public synchronized void resumeQueuedJobs() {
+        if (!accepting || recovery.isShutdown()) return;
+        try { recovery.scheduleWithFixedDelay(this::pumpRecoverySafely, 0, 100, TimeUnit.MILLISECONDS); }
+        catch (RejectedExecutionException ignored) { /* shutdown won the race */ }
+    }
+
+    private void pumpRecoverySafely() {
+        if (!accepting) return;
+        try {
+            for (var job : progress.queued(100)) {
+                if (!scheduledIds.contains(job.jobId())) {
+                    boolean broad = job.scope().equals("period") || job.scope().equals("catalog");
+                    if (!hasCapacity(broad)) return;
+                    dispatchExisting(job);
+                }
+            }
+        } catch (RuntimeException e) {
+            log.error("Could not dispatch persisted sync backlog", e);
+        }
+    }
+
+    private boolean hasCapacity(boolean broad) {
+        int active = dispatcher.getActiveCount() + periodDispatcher.getActiveCount();
+        int queued = dispatcher.getQueue().size() + periodDispatcher.getQueue().size();
+        ThreadPoolExecutor lane = broad ? periodDispatcher : dispatcher;
+        return active + queued < totalQueueWorkers + totalQueueCapacity
+                && (lane.getActiveCount() < lane.getMaximumPoolSize() || lane.getQueue().remainingCapacity() > 0);
     }
 
     public List<LocalDate> absentPeriods() {
@@ -126,12 +311,22 @@ public class SyncService implements DisposableBean {
     private SyncResult runJob(Scope scope, YearMonth month, SyncRequest request, boolean refresh) {
         long jobId = progress.create(scope.name().toLowerCase(Locale.ROOT), request,
                 month.atDay(1), refresh, null, false);
+        return runExistingJob(scope, month, request, refresh, jobId);
+    }
+
+    private SyncResult runExistingJob(Scope scope, YearMonth month, SyncRequest request, boolean refresh, long jobId) {
+        progress.beginRoot(jobId);
+        if (scope == Scope.PERIOD) progress.restartChildren(jobId);
         try {
             SyncResult result = scope == Scope.PERIOD ? fullPeriod(month, refresh, jobId)
                     : scoped(scope, month, request, refresh, jobId);
             progress.finish(jobId, "completed", null);
             return result;
         } catch (RuntimeException e) {
+            if (Thread.currentThread().isInterrupted()) {
+                progress.requeue(jobId, "Worker interrupted during shutdown; queued for restart");
+                throw e;
+            }
             if (scope == Scope.PERIOD) progress.failQueuedChildren(jobId, e.getMessage());
             progress.finish(jobId, "failed", e.getMessage());
             throw e;
@@ -141,6 +336,12 @@ public class SyncService implements DisposableBean {
     private SyncResult runCatalog(CatalogSyncRequest request, YearMonth month, boolean refresh) {
         long parentId = progress.createCatalog("catalog", request, month.atDay(1),
                 request.vehicleType(), refresh, null, false);
+        return runExistingCatalog(request, month, refresh, parentId);
+    }
+
+    private SyncResult runExistingCatalog(CatalogSyncRequest request, YearMonth month, boolean refresh, long parentId) {
+        progress.beginRoot(parentId);
+        progress.restartChildren(parentId);
         try {
             Catalog.Period period = period(month);
             progress.activity(parentId, "vehicleTypes", null, null, null);
@@ -170,6 +371,10 @@ public class SyncService implements DisposableBean {
             return new SyncResult(parentId, month.toString(), "catalog", children.size(),
                     brands, models, variants, 0);
         } catch (RuntimeException e) {
+            if (Thread.currentThread().isInterrupted()) {
+                progress.requeue(parentId, "Worker interrupted during shutdown; queued for restart");
+                throw e;
+            }
             progress.failQueuedChildren(parentId, e.getMessage());
             progress.finish(parentId, "failed", e.getMessage());
             throw e;
@@ -247,9 +452,7 @@ public class SyncService implements DisposableBean {
                 for (Catalog.Model model : availableModels) {
                     List<Catalog.Variant> availableVariants = variants(period, brand, model, refresh, count, jobId);
                     progress.discovered(jobId, 0, 0, availableVariants.size());
-                    for (Catalog.Variant variant : availableVariants) {
-                        price(period, brand, model, variant, refresh, count, jobId);
-                    }
+                    priceModel(period, brand, model, availableVariants, refresh, count, jobId);
                 }
             }
             repository.finishRun(run, "completed", null);
@@ -288,9 +491,7 @@ public class SyncService implements DisposableBean {
             for (Catalog.Model model : availableModels) {
                 List<Catalog.Variant> availableVariants = variants(period, brand, model, refresh, count, jobId);
                 progress.discovered(jobId, 0, 0, availableVariants.size());
-                for (Catalog.Variant variant : availableVariants) {
-                    price(period, brand, model, variant, refresh, count, jobId);
-                }
+                priceModel(period, brand, model, availableVariants, refresh, count, jobId);
             }
         } else {
             Catalog.Model model = models(period, brand, refresh, count, jobId).stream()
@@ -301,7 +502,7 @@ public class SyncService implements DisposableBean {
             if (scope == Scope.MODEL) {
                 progress.discovered(jobId, 0, 0, years.size());
                 progress.discoveryComplete(jobId);
-                for (Catalog.Variant variant : years) price(period, brand, model, variant, refresh, count, jobId);
+                priceModel(period, brand, model, years, refresh, count, jobId);
             } else {
                 Catalog.Variant variant = years.stream()
                         .filter(v -> v.year() == request.modelYear() && v.fuelCode().equals(request.fuelCode()))
@@ -330,12 +531,10 @@ public class SyncService implements DisposableBean {
                 FipeClient.Response<List<FipeResponses.Option>> response = client.brands(period.code(), type);
                 if (response.data() == null) throw new IllegalStateException("Empty FIPE brand response");
                 Instant now = Instant.now();
-                for (FipeResponses.Option option : response.data()) {
-                    Catalog.Brand brand = repository.saveBrand(type, option.value(), option.label(), now);
-                    repository.savePeriodBrand(period.id(), brand.id(), option.label(), now);
-                    count.brands++;
-                }
-                repository.saveBrandList(period.id(), type, response.raw(), now);
+                List<CatalogRepository.BrandInput> inputs = response.data().stream()
+                        .map(option -> new CatalogRepository.BrandInput(option.value(), option.label())).toList();
+                List<Catalog.Brand> saved = repository.persistBrandResponse(period.id(), type, inputs, response.raw(), now);
+                count.brands += saved.size();
             }
             return repository.brands(period.id(), type);
         }
@@ -352,12 +551,11 @@ public class SyncService implements DisposableBean {
                     throw new IllegalStateException("Invalid FIPE model response");
                 }
                 Instant now = Instant.now();
-                for (FipeResponses.ModelOption option : response.data().models()) {
-                    Catalog.Model model = repository.saveModel(brand.id(), option.value(), option.label(), now);
-                    repository.savePeriodModel(period.id(), brand.id(), model.id(), option.label(), now);
-                    count.models++;
-                }
-                repository.saveModelList(period.id(), brand.id(), response.raw(), now);
+                List<CatalogRepository.ModelInput> inputs = response.data().models().stream()
+                        .map(option -> new CatalogRepository.ModelInput(option.value(), option.label())).toList();
+                List<Catalog.Model> saved = repository.persistModelResponse(period.id(), brand.id(), inputs,
+                        response.raw(), now);
+                count.models += saved.size();
             }
             return repository.models(period.id(), brand.id());
         }
@@ -372,16 +570,16 @@ public class SyncService implements DisposableBean {
                         client.years(period.code(), brand.type(), brand.code(), model.code());
                 if (response.data() == null) throw new IllegalStateException("Empty FIPE year response");
                 Instant now = Instant.now();
+                List<CatalogRepository.VariantInput> inputs = new ArrayList<>();
                 for (FipeResponses.Option option : response.data()) {
                     Matcher parsed = YEAR_FUEL.matcher(option.value());
                     if (!parsed.matches()) throw new IllegalStateException("Unknown FIPE year/fuel: " + option.value());
                     int year = Integer.parseInt(parsed.group(1));
-                    Catalog.Variant variant = repository.saveVariant(model.id(), option.value(), year,
-                            parsed.group(2), now);
-                    repository.savePeriodVariant(period.id(), model.id(), variant.id(), option.label(), now);
-                    count.variants++;
+                    inputs.add(new CatalogRepository.VariantInput(option.value(), year, parsed.group(2), option.label()));
                 }
-                repository.saveYearList(period.id(), model.id(), response.raw(), now);
+                List<Catalog.Variant> saved = repository.persistYearResponse(period.id(), model.id(), inputs,
+                        response.raw(), now);
+                count.variants += saved.size();
             }
             return repository.variants(period.id(), model.id());
         }
@@ -408,6 +606,18 @@ public class SyncService implements DisposableBean {
             repository.savePrice(period.id(), variant.id(), value, data.fipeCode(), response.raw(), Instant.now());
             count.prices++;
             progress.processed(jobId, true);
+        }
+    }
+
+    private void priceModel(Catalog.Period period, Catalog.Brand brand, Catalog.Model model,
+                            List<Catalog.Variant> variants, boolean refresh, Counters count, long jobId) {
+        if (variants.isEmpty()) return;
+        Set<Long> fresh = repository.freshPriceVariantIds(period.id(), model.id(),
+                Instant.now().minusSeconds(86400L * ageDays), refresh);
+        long skipped = variants.stream().filter(v -> fresh.contains(v.id())).count();
+        progress.processedBatch(jobId, skipped, false);
+        for (Catalog.Variant variant : variants) {
+            if (!fresh.contains(variant.id())) price(period, brand, model, variant, refresh, count, jobId);
         }
     }
 
@@ -489,8 +699,36 @@ public class SyncService implements DisposableBean {
     }
 
     @Override
-    public void destroy() {
+    public synchronized void destroy() {
+        accepting = false;
+        recovery.shutdownNow();
+        dispatcher.shutdownNow();
+        periodDispatcher.shutdownNow();
         executor.shutdownNow();
+
+        // Do not relinquish the DB ownership lock on a timeout: an interrupt-insensitive
+        // worker may still be changing job state. Keep shutdown (and the lock) pending.
+        boolean interrupted = awaitTerminationUninterruptibly(recovery);
+        interrupted |= awaitTerminationUninterruptibly(dispatcher);
+        interrupted |= awaitTerminationUninterruptibly(periodDispatcher);
+        interrupted |= awaitTerminationUninterruptibly(executor);
+
+        progress.flushPendingForShutdown();
+        for (Long jobId : scheduledIds) {
+            try { progress.requeue(jobId, "Service stopping; queued for restart"); }
+            catch (RuntimeException e) { log.error("Could not requeue sync job {} during shutdown", jobId); }
+        }
+        if (jobGuard != null) jobGuard.releaseAfterWorkers();
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    private static boolean awaitTerminationUninterruptibly(ExecutorService service) {
+        boolean interrupted = false;
+        while (!service.isTerminated()) {
+            try { service.awaitTermination(1, TimeUnit.DAYS); }
+            catch (InterruptedException e) { interrupted = true; }
+        }
+        return interrupted;
     }
 
     private static final class Counters {

@@ -22,14 +22,21 @@ Opções em `src/main/resources/application.properties`:
 | --- | --- | --- |
 | `app.sync.min-age-days` | `365` | Idade mínima para reconsulta de registros existentes. |
 | `app.fipe.min-request-interval-ms` | `1000` | Intervalo global mínimo entre chamadas enviadas à FIPE, inclusive retries. |
+| `app.fipe.shared-rate-limit` (`FIPE_SHARED_RATE_LIMIT`) | `true` | Coordena slots e backoff 429 via PostgreSQL entre instâncias. Desative apenas em testes isolados sem migration V5. |
+| `app.fipe.shared-max-interval-ms` (`FIPE_SHARED_MAX_INTERVAL_MS`) | `60000` | Teto do intervalo compartilhado após 429. |
 | `app.fipe.max-concurrent-syncs` | `2` | Número máximo de sincronizações-filhas simultâneas. |
 | `app.fipe.max-attempts` | `3` | Tentativas totais após falhas HTTP 429/5xx ou de rede. |
 | `app.fipe.retry-backoff-ms` | `5000` | Espera base crescente entre tentativas; também respeita `Retry-After` se maior. |
 | `app.fipe.request-timeout-seconds` | `30` | Timeout de cada chamada FIPE. |
+| `app.fipe.max-backoff-ms` (`FIPE_MAX_BACKOFF_MS`) | `60000` | Teto para backoff exponencial com jitter entre retries. |
+| `app.fipe.max-retry-after-ms` (`FIPE_MAX_RETRY_AFTER_MS`) | `300000` | Teto para `Retry-After` aceito em segundos ou data HTTP. |
+| `management.endpoints.web.exposure.include` | `health,metrics` | Endpoints Actuator expostos; continuam protegidos pelo header `X-API-Token`. |
+
+O limitador volta gradualmente ao intervalo mínimo configurado depois de cinco respostas FIPE bem-sucedidas (reduzindo 10% do excedente por janela). O padrão mínimo segue em `1000` ms, sem aumento automático acima dele. Um `Retry-After` maior que `app.fipe.max-retry-after-ms` causa falha segura sem retry; esse prazo excedente não é persistido globalmente, então outras instâncias podem continuar no intervalo compartilhado adaptativo. Operadores devem aumentar `app.fipe.max-retry-after-ms` se a FIPE retornar prazos maiores que precisem ser respeitados por todas as instâncias. O registry Micrometer é fornecido pelo Actuator. Métricas ficam disponíveis, autenticadas pelo filtro da API, em `/fipely-sinc-service/actuator/metrics` (por exemplo `fipe.request.duration`, `fipe.rate_limit.wait`, `fipe.attempts`, `fipe.responses` e `fipe.calls`). Métricas não incluem `jobId` para evitar cardinalidade ilimitada.
 | `app.fipe.reference-period-cache-minutes` | `1440` | Cache em memória da lista de períodos da FIPE, compartilhado por sincronizações e relatório de ausentes. |
 | `app.websocket.allowed-origins` | `http://localhost:*,http://127.0.0.1:*` | Origens permitidas para o WebSocket no navegador; configure a origem do seu frontend se necessário. |
 
-Uma sincronização mensal completa pode demorar bastante: a resposta HTTP aguarda seu término. Requisições simultâneas **idênticas** compartilham a mesma execução em andamento nesta instância do serviço. Em caso de falha, os registros já salvos continuam disponíveis; uma nova requisição retoma os dados ainda ausentes.
+Uma sincronização mensal completa pode demorar bastante: a resposta HTTP aguarda seu término. Jobs top-level ativos equivalentes são deduplicados pelo PostgreSQL 15+. **A operação de jobs é single-instance**: antes do Flyway executar, uma instância adquire advisory lock de sessão e retém uma conexão PostgreSQL até o shutdown; uma segunda instância falha startup explicitamente, sem requeue de jobs da instância ativa. Reserve ao menos uma conexão de pool além dessa conexão dedicada. O limitador FIPE, por outro lado, é compartilhado e continua global. Faça rollout serial: pare a instância antiga antes de subir a nova. A V5 não modifica jobs preexistentes; se detectar equivalentes ativos, aborta com erro explicativo. Operadores devem inspecionar e resolver manualmente os registros `queued`/`running` equivalentes em `fipe.sync_jobs` e reaplicar o startup. A mudança de schema só ocorre quando Flyway executar no banco de destino — não foi aplicada a nenhum banco real durante o desenvolvimento. O limitador reserva slots e persiste o deadline `Retry-After` em operações DB curtas, liberando a conexão antes de aguardar ou fazer HTTP. O intervalo compartilhado reduz somente após cinco respostas bem-sucedidas. Chamadas simultâneas ao mesmo recurso de catálogo não são coordenadas por recurso entre processos; single-instance evita isso no modo suportado.
 
 ## API
 
@@ -103,3 +110,8 @@ curl -H "X-API-Token: $FIPELY_API_TOKEN" \
 ```
 
 Para mais detalhes sobre origem e estrutura dos dados, consulte [database.md](../docs/database.md) e [fluxo.md](../docs/fluxo.md).
+# Execução de sincronizações
+
+Os `POST /api/v1/sync/*` respondem `202 Accepted` com `{ "jobId": ..., "status": "queued" }` assim que o job top-level é persistido. Consulte `GET /api/v1/sync/jobs/{jobId}` para acompanhar. Pedidos equivalentes ativos compartilham o mesmo jobId. Há duas lanes: pontuais (brand/model/variant) e amplas (período/catálogo); uma vaga de worker é reservada às pontuais, para um período demorado não bloquear toda consulta pontual. Cada lane é FIFO. `FIPE_SYNC_QUEUE_WORKERS` (padrão 2) define o limite comum usado na admissão; `FIPE_SYNC_QUEUE_CAPACITY` (padrão 48) limita o backlog combinado. Fila cheia em nova submissão retorna `503 Service Unavailable`. O backlog persistido é despachado em lotes conforme há vagas, não limitado ao tamanho da fila em memória. A operação de jobs é single-instance protegida pelo advisory lock descrito acima; múltiplas instâncias não processam jobs simultaneamente.
+
+Após reinício, jobs top-level queued/running são re-enfileirados com seu ID original e parâmetros persistidos. Filhos queued/running interrompidos são marcados failed com motivo específico e excluídos da agregação; filhos novos da tentativa retomada passam a compor o progresso. Listas, preços e stamps persistidos são reutilizados. `sync_runs` continua representando somente coleta completa de preços. Para catálogo sem `referenceMonth`, o POST escolhe o mês local mais recente sem acessar FIPE; se não há mês local, retorna `503` pedindo `referenceMonth` explícito para manter o POST não bloqueante.

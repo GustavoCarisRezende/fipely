@@ -4,13 +4,14 @@ import br.com.fipe.sinc_service.dto.CatalogSyncRequest;
 import br.com.fipe.sinc_service.dto.SyncProgress;
 import br.com.fipe.sinc_service.dto.SyncRequest;
 import br.com.fipe.sinc_service.dto.SyncResult;
+import br.com.fipe.sinc_service.dto.SyncAccepted;
 import br.com.fipe.sinc_service.repository.CatalogRepository;
 import br.com.fipe.sinc_service.service.SyncProgressService;
 import br.com.fipe.sinc_service.service.SyncService;
 import java.time.LocalDate;
 import java.util.List;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -36,33 +37,38 @@ public class SyncController {
     }
 
     @PostMapping("/sync/periods")
-    public SyncResult period(@RequestBody SyncRequest request,
+    public ResponseEntity<SyncAccepted> period(@RequestBody SyncRequest request,
                              @RequestParam(defaultValue = "false") boolean refreshOldRecords) {
-        return sync.sync(SyncService.Scope.PERIOD, request, refreshOldRecords);
+        return accepted(sync.submit(SyncService.Scope.PERIOD, request, refreshOldRecords));
     }
 
     @PostMapping("/sync/brands")
-    public SyncResult brand(@RequestBody SyncRequest request,
+    public ResponseEntity<SyncAccepted> brand(@RequestBody SyncRequest request,
                             @RequestParam(defaultValue = "false") boolean refreshOldRecords) {
-        return sync.sync(SyncService.Scope.BRAND, request, refreshOldRecords);
+        return accepted(sync.submit(SyncService.Scope.BRAND, request, refreshOldRecords));
     }
 
     @PostMapping("/sync/models")
-    public SyncResult model(@RequestBody SyncRequest request,
+    public ResponseEntity<SyncAccepted> model(@RequestBody SyncRequest request,
                             @RequestParam(defaultValue = "false") boolean refreshOldRecords) {
-        return sync.sync(SyncService.Scope.MODEL, request, refreshOldRecords);
+        return accepted(sync.submit(SyncService.Scope.MODEL, request, refreshOldRecords));
     }
 
     @PostMapping("/sync/variants")
-    public SyncResult variant(@RequestBody SyncRequest request,
+    public ResponseEntity<SyncAccepted> variant(@RequestBody SyncRequest request,
                               @RequestParam(defaultValue = "false") boolean refreshOldRecords) {
-        return sync.sync(SyncService.Scope.VARIANT, request, refreshOldRecords);
+        return accepted(sync.submit(SyncService.Scope.VARIANT, request, refreshOldRecords));
     }
 
     @PostMapping("/sync/catalog")
-    public SyncResult catalog(@RequestBody(required = false) CatalogSyncRequest request,
+    public ResponseEntity<SyncAccepted> catalog(@RequestBody(required = false) CatalogSyncRequest request,
                               @RequestParam(defaultValue = "false") boolean refreshOldRecords) {
-        return sync.syncCatalog(request, refreshOldRecords);
+        return accepted(sync.submitCatalog(request, refreshOldRecords));
+    }
+
+    private static ResponseEntity<SyncAccepted> accepted(SyncService.Accepted accepted) {
+        return ResponseEntity.status(HttpStatus.ACCEPTED)
+                .body(new SyncAccepted(accepted.jobId(), accepted.status()));
     }
 
     @GetMapping("/sync/jobs")
